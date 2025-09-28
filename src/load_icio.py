@@ -17,7 +17,6 @@ import argparse
 import pandas as pd
 from gremlin_python.driver.client import Client, serializer
 from gremlin_python.driver.protocol import GremlinServerError
-from azure.cosmos import CosmosClient, PartitionKey
 import math
 import sys
 import os
@@ -25,48 +24,28 @@ import time
 from typing import Iterable, Tuple, Dict, Any
 
 from dotenv import load_dotenv
+from check_db_stats import check_database_stats, build_client, get_existing_vertex_ids, get_graph_stats
 load_dotenv()
 
 # Base endpoint from Cosmos DB portal
-SQL_ENDPOINT = 'https://nwang.documents.azure.com'
+SQL_ENDPOINT = 'https://graph-db-osint.documents.azure.com:443/'
 # Gremlin endpoint uses WebSocket protocol with .gremlin.cosmos.azure.com suffix
-GREMLIN_ENDPOINT = 'wss://nwang.gremlin.cosmos.azure.com:443'
-DATABASE = 'ICIO'
+GREMLIN_ENDPOINT = 'wss://graph-db-osint.gremlin.cosmos.azure.com:443'
+DATABASE = 'osint-db'
 
-# Setup helpers
-def check_graph(
-    graph: str,
-    partition_key_field: str,
-    throughput: int,
-):
-    """
-    Ensures the Cosmos DB database and Gremlin graph (container) exist.
-    Uses azure-cosmos SDK (SQL API) since Gremlin is provisioned on same account.
-    """
-    key = os.getenv("PRIMARY_KEY")
-    cosmos = CosmosClient(SQL_ENDPOINT, credential=key)
 
-    # Create database if not exists
-    db = cosmos.get_database_client(DATABASE)
-
-    # Create container (graph) if not exists
-    db.create_container_if_not_exists(
-        id=graph,
-        partition_key=PartitionKey(path=f"/{partition_key_field}"),
-        offer_throughput=throughput,
-    )
-    print(f"Graph '{graph}' is ready in database '{DATABASE}'.")
 
 # Gremlin helpers
 def build_client(graph: str) -> Client:
-    primary_key = os.getenv("PRIMARY_KEY")
-    return Client(
+    ACCOUNT_KEY = os.getenv("ACCOUNT_KEY")
+    client = Client(
         GREMLIN_ENDPOINT,
         "g",
         username=f"/dbs/{DATABASE}/colls/{graph}",
-        password=primary_key,
+        password=ACCOUNT_KEY,
         message_serializer=serializer.GraphSONSerializersV2d0()
     )
+
 
 def upsert_vertices_gremlin_cmd(vertex_props: Iterable[Tuple[str, Dict[str, Any]]]):
     """Generate individual Gremlin commands for vertex upserts"""
@@ -135,11 +114,24 @@ def retry_with_backoff(func, max_retries=5, base_delay=0.1):
 
 
 # CSV parsing
-def read_wide_icio(csv_path: str, index_col: str = "V1", out_col: str = "OUT"):
+def read_icio(csv_path: str, index_col: str = "V1"):
     df = pd.read_csv(csv_path, index_col=index_col)
     df = df.apply(pd.to_numeric, errors="coerce")
     all_cols = list(df.columns)
-    sector_cols = [c for c in all_cols if str(c) != out_col]
+    
+    # Filter out final demand categories
+    final_demand_codes = ['HFCE', 'NPISH', 'GGFC', 'GFCF', 'INVNT', 'DPABR', 'OUT']
+    sector_cols = []
+    for c in all_cols:
+        col_str = str(c)
+        # Skip if it's a final demand category
+        if any(fd_code in col_str for fd_code in final_demand_codes):
+            continue
+        # Skip if it doesn't follow the COUNTRY_INDUSTRY pattern
+        if '_' not in col_str:
+            continue
+        sector_cols.append(c)
+    
     return df, sector_cols
 
 
@@ -148,12 +140,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
     ap.add_argument("--index-col", default="V1")
-    ap.add_argument("--out-col", default="OUT")
 
     ap.add_argument("--graph", required=True)
 
-    ap.add_argument("--partition-key-field", default="pk")
-    ap.add_argument("--throughput", type=int, default=400)
+    ap.add_argument("--throughput", type=int, default=1000)
     ap.add_argument(
         "--min-value", type=float, default=1e-9, help="Drop flows smaller than this"
     )
@@ -161,9 +151,15 @@ def main():
     ap.add_argument("--skip-vertices", action="store_true", help="Skip upserting vertices")
     args = ap.parse_args()
 
+    # Connect to Cosmos for stats check
+    vertex_count, edge_count = check_database_stats(args.graph, "pk", args.throughput)
+    
+    # Build client for data operations
+    client = build_client(args.graph)
+
     print("Reading CSV...")
-    df, sector_cols = read_wide_icio(
-        args.csv, index_col=args.index_col, out_col=args.out_col
+    df, sector_cols = read_icio(
+        args.csv, index_col=args.index_col
     )
     print(f"Found {len(df)} supplier rows, {len(sector_cols)} target columns")
 
@@ -176,24 +172,21 @@ def main():
             return node_id.split("_", 1)[0]
         return node_id
 
-    def node_label(node_id: str):
-        # classify node
-        if "_" not in node_id:
-            return "sector"
-        _, suffix = node_id.split("_", 1)
-        # OECD FD categories: HFCE, NPISH, GGFC, GFCF, INVNT, DPABR
-        if suffix in {"HFCE", "NPISH", "GGFC", "GFCF", "INVNT", "DPABR"}:
-            return "final_demand"
-        return "sector"
+    def node_to_sector(node_id: str):
+        if "_" in node_id:
+            return node_id.split("_", 1)[1]
+        return node_id
 
     # Prepare vertex records
     v_records = {}
     for n in all_nodes:
         country = node_to_country(n)
+        sector = node_to_sector(n)
         v_records[n] = {
-            "label": node_label(n),
-            args.partition_key_field: country,
+            "label": "Country_sector",
+            "pk": n,  # Country_sector as partition key
             "country": country,
+            "sector": sector,
             "id_str": n,
         }
 
@@ -210,15 +203,8 @@ def main():
             edges.append((supplier, str(target), {"label": "supplies", "value": float(val)}))
 
     print(
-        f"Prepared {len(v_records)} vertices and {len(edges)} edges (including final demand)."
+        f"Prepared {len(v_records)} vertices and {len(edges)} edges (excluding final demand)."
     )
-
-    # Connect to Cosmos
-    print("Validating graph status for update...")
-    check_graph(args.graph, args.partition_key_field, args.throughput)
-
-    print("Connecting to Cosmos Gremlin endpoint...")
-    client = build_client(args.graph)
 
     # Upsert vertices
     if not args.skip_vertices:
@@ -255,6 +241,14 @@ def main():
                 raise
 
     print(f"Completed edge insertion: {edge_count} edges")
+
+    # Show final graph statistics
+    print("Checking final graph statistics...")
+    final_vertex_count, final_edge_count = get_graph_stats(client)
+    if final_vertex_count is not None and final_edge_count is not None:
+        print(f"Final graph contains {final_vertex_count} nodes and {final_edge_count} relationships")
+    else:
+        print("Could not retrieve final graph statistics")
 
     print("Done.")
 
