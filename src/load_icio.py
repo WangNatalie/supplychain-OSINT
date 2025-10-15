@@ -115,24 +115,29 @@ def retry_with_backoff(func, max_retries=5, base_delay=0.1):
 
 # CSV parsing
 def read_icio(csv_path: str, index_col: str = "V1"):
-    df = pd.read_csv(csv_path, index_col=index_col)
-    df = df.apply(pd.to_numeric, errors="coerce")
-    all_cols = list(df.columns)
-    
-    # Filter out final demand categories
-    final_demand_codes = ['HFCE', 'NPISH', 'GGFC', 'GFCF', 'INVNT', 'DPABR', 'OUT']
-    sector_cols = []
-    for c in all_cols:
-        col_str = str(c)
-        # Skip if it's a final demand category
-        if any(fd_code in col_str for fd_code in final_demand_codes):
-            continue
-        # Skip if it doesn't follow the COUNTRY_INDUSTRY pattern
-        if '_' not in col_str:
-            continue
-        sector_cols.append(c)
-    
-    return df, sector_cols
+    try:
+        df = pd.read_csv(csv_path, index_col=index_col)
+        df = df.apply(pd.to_numeric, errors="coerce")
+        all_cols = list(df.columns)
+        
+        # Filter out final demand categories
+        final_demand_codes = ['HFCE', 'NPISH', 'GGFC', 'GFCF', 'INVNT', 'DPABR', 'OUT']
+        sector_cols = []
+        for c in all_cols:
+            col_str = str(c)
+            # Skip if it's a final demand category
+            if any(fd_code in col_str for fd_code in final_demand_codes):
+                continue
+            # Skip if it doesn't follow the COUNTRY_INDUSTRY pattern
+            if '_' not in col_str:
+                continue
+            sector_cols.append(c)
+        
+        return df, sector_cols
+        
+    except FileNotFoundError:
+       print(f"Error: File {csv_path} not found")
+       
 
 
 # Main ETL logic
@@ -149,6 +154,7 @@ def main():
     )
     ap.add_argument("--batch-size", type=int, default=200)
     ap.add_argument("--skip-vertices", action="store_true", help="Skip upserting vertices")
+    ap.add_argument("--dry-run", action="store_true", help="Stop after preparing vertices and edges, don't perform any upserts")
     args = ap.parse_args()
 
     # Connect to Cosmos for stats check
@@ -205,6 +211,11 @@ def main():
     print(
         f"Prepared {len(v_records)} vertices and {len(edges)} edges (excluding final demand)."
     )
+
+    # Exit early if dry-run mode
+    if args.dry_run:
+        print("Dry run mode: Stopping after preparation. No data will be upserted.")
+        return
 
     # Upsert vertices
     if not args.skip_vertices:
