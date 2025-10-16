@@ -254,7 +254,7 @@ def build_graph(
     edges_feat_t = build_edge_features(edges_t, node_feats_t, edges_prev)
     
     # 4) Labels
-    labels = label_trade_drops(edges_t, edges_t1, drop_threshold)
+    labels = label_trade_drops(edges_t, edges_t1, edges_prev, drop_threshold)
     
     # 5) Merge
     merged = edges_feat_t.merge(
@@ -349,7 +349,7 @@ def main():
         external_data=external_data,
         year=1995
     )
-    torch.save(graph, "embeddings/graph_1995_labeled.pt")
+    torch.save(graph, "src/embeddings/graph_1995_labeled.pt")
     print(f"Saved 1995 graph. Nodes: {graph.num_nodes}, Edges: {graph.edge_index.shape[1]}")
     print(f"  Node features: {graph.x.shape[1]}, Edge features: {graph.edge_attr.shape[1]}")
     print(f"  Positive class: {graph.y.sum().item()}/{len(graph.y)} ({100*graph.y.mean():.2f}%)")
@@ -376,7 +376,7 @@ def main():
             year=year
         )
         
-        torch.save(graph, f"embeddings/graph_{year}_labeled.pt")
+        torch.save(graph, f"src/embeddings/graph_{year}_labeled.pt")
         print(f"Saved {year} graph. Nodes: {graph.num_nodes}, Edges: {graph.edge_index.shape[1]}")
         print(f"  Node features: {graph.x.shape[1]}, Edge features: {graph.edge_attr.shape[1]}")
         print(f"  Positive class: {graph.y.sum().item()}/{len(graph.y)} ({100*graph.y.mean():.2f}%)")

@@ -41,6 +41,7 @@ def calculate_rest_of_world(year: int, indicators, countries, unique_countries, 
 
                     mean_val = pd.to_numeric(series, errors='coerce').mean()
                     row_values[col_name] = mean_val
+                    logger.info(f"ROW mean for {col_name}: {mean_val:.3f}")
 
                 except Exception as e:
                     logger.warning(f"    ROW {col_name}: failed ({type(e).__name__}) - {e}")
@@ -66,24 +67,20 @@ def fill_with_region_mean(external, indicators, year):
     for wb_code, col_name in indicators.items():
         missing_countries = external[external[col_name].isna()].index
 
+        filled = 0
         for node in missing_countries:
             # Get the region code
             try:
                 c = node.split('_')[0]
-                if c == "ROW":
+                if c == "ROW": # This should not happen
                     logger.info("Found 'ROW', skipping.")
                     continue
 
                 if c in region_map_override:
                     region = region_map_override[c]
                 else:
-                    meta = wb.economy.info(c)
-                    region = getattr(meta.region, "id", None)
-                    if region is None and isinstance(meta.region, dict):
-                        region = meta.region.get('id')
-
-                    # If response is a dictionary
-                    # region = meta.get('region', {}).get('id')
+                    meta = wb.economy.get(c)
+                    region = meta['region']
 
                 if not region:
                     logger.warning(f"No region info for {c}; skipping regional fill")
@@ -112,10 +109,13 @@ def fill_with_region_mean(external, indicators, year):
                         logger.info(f"  {c} {col_name}: Regional mean and world main not available. Value set to NaN.")
 
                 if pd.notna(value):
-                    external.loc[c, col_name] = value
+                    external.loc[node, col_name] = value
+                    filled += 1
 
             except Exception as e:
                 logger.warning(f"Failed region fill for {c}, {col_name}: {type(e).__name__} - {e}")
+            
+        logger.info(f"Filled {filled}/{len(missing_countries)} missing nodes with regional average indicator values")
 
     return external
 
