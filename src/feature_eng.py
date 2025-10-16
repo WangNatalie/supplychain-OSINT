@@ -5,6 +5,7 @@ import numpy as np
 from torch_geometric.data import Data
 from typing import List, Optional, Tuple
 from world_data import load_indicators
+import argparse
 
 def build_node_features(edges_t: pd.DataFrame, 
                         edges_prev: Optional[pd.DataFrame] = None,
@@ -330,48 +331,53 @@ def main():
     Memory-efficient pipeline for 16GB RAM.
     Only keeps previous year's edges in memory.
     """
-    print("Reading 1995 ICIO table...")
-    df_t, cols = read_icio("ICIO/1995_SML.csv")
-    print("Reading 1996 ICIO table...")
-    df_t1, cols_t1 = read_icio("ICIO/1996_SML.csv")
-    
-    # Fixed node index
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start-year", type=int, default=1995)
+    ap.add_argument("--end-year", type=int, default=2022)
+    args = ap.parse_args()
+
+    # Fixed node index from first year
+    print("Reading 1995 ICIO table to establish node index...")
+    df_first, cols = read_icio("ICIO/1995_SML.csv")
     nodes_global = pd.Index(sorted(cols))
     
-    # Process 1995 (no lag available for first year)
-    print("Generating 1995 graph...")
-    external_data = load_indicators(1995, nodes_global)
-    graph, edges_df, _ = build_graph(
-        df_t, df_t1, cols,
-        drop_threshold=0.1,
-        global_node_index=nodes_global,
-        edges_prev=None,  # No previous year for 1995
-        external_data=external_data,
-        year=1995
-    )
-    torch.save(graph, "src/embeddings/graph_1995_labeled.pt")
-    print(f"Saved 1995 graph. Nodes: {graph.num_nodes}, Edges: {graph.edge_index.shape[1]}")
-    print(f"  Node features: {graph.x.shape[1]}, Edge features: {graph.edge_attr.shape[1]}")
-    print(f"  Positive class: {graph.y.sum().item()}/{len(graph.y)} ({100*graph.y.mean():.2f}%)")
+    edges_prev = None  # No lag for first year
+    df_t = None
+    cols_t = None
+
+    # Load previous year if it exists (for lag features)
+    prev_year = args.start_year - 1
+    prev_file = f"ICIO/{prev_year}_SML.csv"
+    import os
+    if os.path.exists(prev_file):
+        print(f"Loading {prev_year} for lag features...")
+        df_prev, cols_prev = read_icio(prev_file)
+        edges_prev = icio_to_edges(df_prev, cols_prev)
+        print(f"  Lag features will be available starting from {args.start_year}")
+    else:
+        print(f"No {prev_year} data found - first year will have no lag features")
     
-    # Keep only edge list from previous year (memory efficient)
-    edges_prev = icio_to_edges(df_t, cols)
-    
-    # Process remaining years
-    for year in range(1996, 2007):
-        df_t = df_t1
-        cols = cols_t1
+    # Process all years in single loop
+    for year in range(args.start_year, args.end_year):
+        # Load current year if not already loaded
+        if df_t is None:
+            print(f"\nReading {year} ICIO table...")
+            df_t, cols_t = read_icio(f"ICIO/{year}_SML.csv")
         
-        print(f"\nReading {year+1} ICIO table...")
+        # Load next year
+        print(f"Reading {year+1} ICIO table...")
         df_t1, cols_t1 = read_icio(f"ICIO/{year+1}_SML.csv")
         
-        print(f"Generating {year} graph with lag features...")
+        # Generate graph
+        lag_status = "with lag features" if edges_prev is not None else "(no lag - first year)"
+        print(f"Generating {year} graph {lag_status}...")
         external_data = load_indicators(year, nodes_global)
         graph, edges_df, _ = build_graph(
-            df_t, df_t1, cols,
+            df_t, df_t1, cols_t,
             drop_threshold=0.1,
             global_node_index=nodes_global,
-            edges_prev=edges_prev,  # Use previous year
+            edges_prev=edges_prev,
             external_data=external_data,
             year=year
         )
@@ -381,11 +387,13 @@ def main():
         print(f"  Node features: {graph.x.shape[1]}, Edge features: {graph.edge_attr.shape[1]}")
         print(f"  Positive class: {graph.y.sum().item()}/{len(graph.y)} ({100*graph.y.mean():.2f}%)")
         
-        # Update previous edges (overwrites to save memory)
-        edges_prev = icio_to_edges(df_t, cols)
+        # Update for next iteration (memory efficient)
+        edges_prev = icio_to_edges(df_t, cols_t)
+        df_t = df_t1
+        cols_t = cols_t1
     
     print("\n✓ Pipeline complete!")
-    print(f"Generated graphs for years 1995-2006")
+    print(f"Generated graphs for years {args.start_year}-{args.end_year}")
     print(f"Saved to embeddings/ directory")
 
 if __name__ == "__main__":
