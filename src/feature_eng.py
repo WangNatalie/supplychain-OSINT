@@ -2,6 +2,7 @@ from load_icio import read_icio
 import torch
 import pandas as pd
 import numpy as np
+import os
 from torch_geometric.data import Data
 from typing import List, Optional, Tuple
 from world_data import load_indicators
@@ -238,7 +239,8 @@ def build_graph(
     global_node_index: Optional[pd.Index] = None,
     edges_prev: Optional[pd.DataFrame] = None,
     external_data: Optional[pd.DataFrame] = None,
-    year: Optional[int] = None
+    year: Optional[int] = None,
+    start_year: Optional[int] = None
 ) -> Tuple[Data, pd.DataFrame, pd.Index]:
     """
     Build graph with 1-year temporal features.
@@ -311,17 +313,31 @@ def build_graph(
     
     # 11) Optional: Add year encoding (cheap feature)
     if year is not None:
-        year_normalized = (year - 1995) / 20.0
+        year_normalized = (year - start_year) / 20.0
         time_feat = torch.full((x.shape[0], 1), year_normalized, dtype=torch.float32)
         x = torch.cat([x, time_feat], dim=1)
     
     # 12) Assemble graph
+    value_t = torch.tensor(
+        merged_std["value_t"].values, 
+        dtype=torch.float32
+    )
+    value_t1 = torch.tensor(
+        merged_std["value_t1"].values, 
+        dtype=torch.float32
+    )
+    
     graph = Data(
         x=x,
         edge_index=edge_index,
         edge_attr=edge_attr,
         y=edge_y,
-        num_nodes=len(nodes)
+        value_t=value_t,
+        value_t1=value_t1,
+        num_nodes=len(nodes),
+        node_labels=list(nodes),
+        node_id_to_idx={n: i for i, n in enumerate(nodes)},
+        edge_labels=list(zip(merged_std["source"], merged_std["target"]))
     )
     
     return graph, merged_std, nodes
@@ -330,16 +346,17 @@ def main():
     """
     Memory-efficient pipeline for 16GB RAM.
     Only keeps previous year's edges in memory.
+    Usage: python feature_eng.py --start-year [start year] --end-year [end year]
     """
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start-year", type=int, default=1995)
+    ap.add_argument("--start-year", type=int, default=1996)
     ap.add_argument("--end-year", type=int, default=2022)
     args = ap.parse_args()
 
     # Fixed node index from first year
-    print("Reading 1995 ICIO table to establish node index...")
-    df_first, cols = read_icio("ICIO/1995_SML.csv")
+    print("Reading first year ICIO table to establish node index...")
+    df_first, cols = read_icio(f"ICIO/{args.start_year}_SML.csv")
     nodes_global = pd.Index(sorted(cols))
     
     edges_prev = None  # No lag for first year
@@ -349,7 +366,6 @@ def main():
     # Load previous year if it exists (for lag features)
     prev_year = args.start_year - 1
     prev_file = f"ICIO/{prev_year}_SML.csv"
-    import os
     if os.path.exists(prev_file):
         print(f"Loading {prev_year} for lag features...")
         df_prev, cols_prev = read_icio(prev_file)
@@ -379,10 +395,11 @@ def main():
             global_node_index=nodes_global,
             edges_prev=edges_prev,
             external_data=external_data,
-            year=year
+            year=year,
+            start_year=args.start_year
         )
         
-        torch.save(graph, f"src/embeddings/graph_{year}_labeled.pt")
+        torch.save(graph, f"embeddings/graph_{year}_labeled.pt")
         print(f"Saved {year} graph. Nodes: {graph.num_nodes}, Edges: {graph.edge_index.shape[1]}")
         print(f"  Node features: {graph.x.shape[1]}, Edge features: {graph.edge_attr.shape[1]}")
         print(f"  Positive class: {graph.y.sum().item()}/{len(graph.y)} ({100*graph.y.mean():.2f}%)")
@@ -393,7 +410,7 @@ def main():
         cols_t = cols_t1
     
     print("\n✓ Pipeline complete!")
-    print(f"Generated graphs for years {args.start_year}-{args.end_year}")
+    print(f"Generated graphs for years {args.start_year}-{args.end_year-1}")
     print(f"Saved to embeddings/ directory")
 
 if __name__ == "__main__":
