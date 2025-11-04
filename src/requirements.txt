@@ -19,3 +19,5 @@ typing
 psutil
 dotenv
 wbgapi
+matplotlib
+seaborn

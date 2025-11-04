@@ -1,9 +1,0 @@
-python training.py \
-    --train-start 1996 --train-end 2018 \
-    --val-start 2019 --val-end 2019 \
-    --test-start 2020 --test-end 2021 \
-    --hidden-dim 64 \
-    --num-layers 2 \
-    --epochs 20 \
-    --lr 0.001 \
-    --auto-resume

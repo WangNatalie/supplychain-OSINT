@@ -336,7 +336,7 @@ def main():
     
     # Load graph
     print(f"Loading graph from {args.graph}...")
-    graph = torch.load(args.graph, map_location=args.device)
+    graph = torch.load(args.graph, map_location=args.device, weights_only=False)
     
     # List nodes if requested
     if args.list_nodes:
@@ -367,7 +367,7 @@ def main():
     
     # Load model
     print(f"Loading model from {args.model}...")
-    checkpoint = torch.load(args.model, map_location=args.device)
+    checkpoint = torch.load(args.model, map_location=args.device, weights_only=False)
     
     # Import model class (assume it's in training.py)
     try:
