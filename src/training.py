@@ -37,6 +37,9 @@ from loss_functions import get_loss_function
 from tqdm import tqdm
 import time
 
+# Epsilon for sign comparisons; overridden by --sign-eps
+SIGN_EPS = 1e-4
+
 def print_memory_usage(prefix=""):
     process = psutil.Process(os.getpid())
     mem_gb = process.memory_info().rss / 1024**3
@@ -96,17 +99,21 @@ class ShockPropagationGNN(torch.nn.Module):
         
         # Edge value change predictor
         # Predicts Δlog(value) = log(value_t+1) - log(value_t)
-        edge_mlp_in = 2 * hidden_dim + edge_in_dim
+        edge_mlp_in = 2 * hidden_dim + edge_in_dim + 1
         self.edge_mlp = torch.nn.Sequential(
             torch.nn.Linear(edge_mlp_in, hidden_dim),
             torch.nn.LayerNorm(hidden_dim),
             torch.nn.ReLU(),
             torch.nn.Dropout(dropout),
             torch.nn.Linear(hidden_dim, hidden_dim // 2),
-            torch.nn.ReLU(),
+            torch.nn.Tanh(),  # Changed from ReLU to allow negative predictions
             torch.nn.Dropout(dropout),
             torch.nn.Linear(hidden_dim // 2, 1)  # Predict Δlog(value)
         )
+        
+        # Learnable output scaling to match target range
+        self.output_scale = torch.nn.Parameter(torch.ones(1) * 2.0)
+        self.output_bias = torch.nn.Parameter(torch.zeros(1))
     
     def forward(self, x, edge_index, edge_attr, shock_mask_nodes=None, shock_mask_edges=None):
         """
@@ -140,10 +147,8 @@ class ShockPropagationGNN(torch.nn.Module):
         # Augment node features: [original || is_shocked || has_shocked_supplier]
         x_augmented = torch.cat([x, shock_mask_nodes, downstream_indicator], dim=1)
         
-        # Encode
         x = self.node_encoder(x_augmented)
         
-        # Message passing (propagate shock information)
         for i, (conv, bn) in enumerate(zip(self.convs, self.batch_norms)):
             x = conv(x, edge_index)
             x = bn(x)
@@ -151,21 +156,20 @@ class ShockPropagationGNN(torch.nn.Module):
                 x = F.relu(x)
                 x = F.dropout(x, p=self.dropout, training=self.training)
         
-        # Edge-level prediction
         src_emb = x[src_idx]
         tgt_emb = x[tgt_idx]
         
-        # Optionally include edge shock indicator in edge features
         if shock_mask_edges is not None:
             shock_mask_edges = shock_mask_edges.view(-1, 1).float()
-            edge_attr_augmented = torch.cat([edge_attr, shock_mask_edges], dim=1)
-            # Adjust MLP input size if needed (or pad edge_attr)
-            # For simplicity, we'll use original edge_attr
+            edge_feat = torch.cat([edge_attr, shock_mask_edges], dim=1)
+        else:
+            edge_feat = torch.cat([edge_attr, torch.zeros(edge_attr.size(0), 1, device=edge_attr.device)], dim=1)
+
+        edge_input = torch.cat([src_emb, tgt_emb, edge_feat], dim=1)
         
-        edge_input = torch.cat([src_emb, tgt_emb, edge_attr], dim=1)
-        
-        # Predict change in log(value)
         delta_log_value = self.edge_mlp(edge_input).squeeze(-1)
+        
+        delta_log_value = delta_log_value * self.output_scale + self.output_bias
         
         return delta_log_value
 
@@ -180,15 +184,10 @@ def load_graphs(years: List[int], embeddings_dir: str = "embeddings") -> List[Da
             continue
         graph = torch.load(path, weights_only=False)
         graph.year = year
-        
-        # Verify required attributes
+
         if not hasattr(graph, 'edge_attr'):
             print(f"Warning: Graph {year} missing edge_attr")
             continue
-        
-        # Extract value_t and value_t1 from edge features if not already separate
-        # Assuming your edge features include log_value_t and we have pct_change
-        # We'll extract from the labeled data
         
         graphs.append(graph)
     return graphs
@@ -315,12 +314,12 @@ def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0
     }
 
 
-def train_epoch(model, optimizer, training_metadata, device, loss_fn, accumulation_steps=4):
+def train_epoch(model, optimizer, training_metadata, device, loss_fn, accumulation_steps=4, edge_sample_ratio=0.3):
     """Train with gradient accumulation to reduce memory per step"""
     model.train()
     total_loss = 0
     total_samples = 0
-    total_direction_correct = 0
+    total_direction_correct_count = 0
     
     optimizer.zero_grad()
     
@@ -331,7 +330,7 @@ def train_epoch(model, optimizer, training_metadata, device, loss_fn, accumulati
         step_start = time.time()
             
         # Load graph only when needed
-        example = load_and_process_example(metadata, device)
+        example = load_and_process_example(metadata, device, edge_sample_ratio=edge_sample_ratio)
         load_time = time.time() - step_start
 
         # Forward pass
@@ -356,10 +355,14 @@ def train_epoch(model, optimizer, training_metadata, device, loss_fn, accumulati
         loss.backward()
         backward_time = time.time() - backward_start
         
-        # Track direction accuracy
+        # Track direction accuracy with epsilon around zero (global counting)
         with torch.no_grad():
-            direction_correct = (torch.sign(predictions) == torch.sign(example['target'])).float().mean()
-            total_direction_correct += direction_correct.item() * len(example['target'])
+            preds_detached = predictions.detach()
+            targets = example['target']
+            pred_sign = torch.where(preds_detached.abs() < SIGN_EPS, torch.zeros_like(preds_detached), torch.sign(preds_detached))
+            target_sign = torch.where(targets.abs() < SIGN_EPS, torch.zeros_like(targets), torch.sign(targets))
+            correct_count = (pred_sign == target_sign).sum().item()
+            total_direction_correct_count += correct_count
         
         total_loss += loss.item() * len(example['target']) * accumulation_steps
         total_samples += len(example['target'])
@@ -388,12 +391,12 @@ def train_epoch(model, optimizer, training_metadata, device, loss_fn, accumulati
     
     return {
         'loss': total_loss / total_samples,
-        'direction_acc': total_direction_correct / total_samples
+        'direction_acc': (total_direction_correct_count / total_samples) if total_samples > 0 else 0.0
     }
 
 
 @torch.no_grad()
-def evaluate(model, training_metadata, device) -> Dict[str, float]:
+def evaluate(model, training_metadata, device, edge_sample_ratio=1.0) -> Dict[str, float]:
     """Evaluate model on predicting edge value changes"""
     model.eval()
     
@@ -404,7 +407,7 @@ def evaluate(model, training_metadata, device) -> Dict[str, float]:
     
     for metadata in training_metadata:  
 
-        example = load_and_process_example(metadata, device)
+        example = load_and_process_example(metadata, device, edge_sample_ratio=edge_sample_ratio)
         
         predictions = model(
             example['graph'].x,
@@ -438,56 +441,89 @@ def evaluate(model, training_metadata, device) -> Dict[str, float]:
     log_values_t1_pred = log_values_t + all_preds
     values_t1_pred = np.expm1(log_values_t1_pred)
     
-    mape = np.mean(np.abs((all_values_t1_true - values_t1_pred) / (all_values_t1_true + 1e-8))) * 100
+    eps = 1e-6
+    # Classic MAPE can explode when true values are ~0 (kept for reference)
+    denom = np.maximum(np.abs(all_values_t1_true), eps)
+    mape = float(np.mean(np.abs((values_t1_pred - all_values_t1_true) / denom)) * 100)
+    # SMAPE is better behaved near zero - use this as primary percentage metric
+    smape = float(np.mean(2.0 * np.abs(values_t1_pred - all_values_t1_true) /
+                          (np.abs(values_t1_pred) + np.abs(all_values_t1_true) + eps)) * 100)
     
-    # Directional accuracy (did we predict the right direction of change?)
-    direction_correct = (np.sign(all_targets) == np.sign(all_preds)).mean()
-    
+    # Directional accuracy (with epsilon around zero)
+    sign_target = np.where(np.abs(all_targets) < SIGN_EPS, 0, np.sign(all_targets))
+    sign_pred = np.where(np.abs(all_preds) < SIGN_EPS, 0, np.sign(all_preds))
+    direction_correct_mask = (sign_target == sign_pred)
+    direction_acc = float(direction_correct_mask.mean())
+
+    # Directional accuracy split by gains (>0) and drops (<0)
+    gains_mask = all_targets > SIGN_EPS
+    drops_mask = all_targets < -SIGN_EPS
+    gain_dir_acc = float(direction_correct_mask[gains_mask].mean()) if gains_mask.any() else 0.0
+    drop_dir_acc = float(direction_correct_mask[drops_mask].mean()) if drops_mask.any() else 0.0
+
+    # Drop detection F1 (treat "drop" as positive class)
+    tp = float(np.sum((sign_pred < 0) & (sign_target < 0)))
+    fp = float(np.sum((sign_pred < 0) & (sign_target >= 0)))
+    fn = float(np.sum((sign_pred >= 0) & (sign_target < 0)))
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    drop_f1 = 2.0 * precision * recall / (precision + recall + 1e-8)
+
+    # Sign distributions
+    target_neg_frac = float((all_targets < -SIGN_EPS).mean())
+    target_zero_frac = float((np.abs(all_targets) <= SIGN_EPS).mean())
+    target_pos_frac = float((all_targets > SIGN_EPS).mean())
+    pred_neg_frac = float((all_preds < -SIGN_EPS).mean())
+    pred_zero_frac = float((np.abs(all_preds) <= SIGN_EPS).mean())
+    pred_pos_frac = float((all_preds > SIGN_EPS).mean())
+
     return {
         'mse': mse,
         'rmse': np.sqrt(mse),
         'mae': mae,
         'r2': r2,
         'mape': mape,
-        'direction_accuracy': direction_correct
+        'smape': smape,
+        # Direction metrics
+        'direction_acc': direction_acc,
+        'gain_dir_acc': gain_dir_acc,
+        'drop_dir_acc': drop_dir_acc,
+        'drop_f1': float(drop_f1),
+        # Distributions
+        'target_neg_frac': target_neg_frac,
+        'target_zero_frac': target_zero_frac,
+        'target_pos_frac': target_pos_frac,
+        'pred_neg_frac': pred_neg_frac,
+        'pred_zero_frac': pred_zero_frac,
+        'pred_pos_frac': pred_pos_frac,
     }
 
 
 def get_best_metric(metrics: Dict[str, float], metric_name: str) -> float:
     """
     Return the scalar to optimize for validation scheduling/early stopping.
-    Higher-is-better metrics: r2, direction_accuracy
+    Higher-is-better metrics: r2, direction_acc
     Lower-is-better metrics: mse, rmse, mae, mape
     Falls back gracefully if the requested metric is missing.
     """
     name = (metric_name or "r2").lower()
 
-    # Try direct hit first
     if name in metrics:
         value = metrics[name]
     else:
-        # Friendly aliases
-        alias_map = {
-            'direction_acc': 'direction_accuracy',
-        }
-        fallback_key = alias_map.get(name)
-        if fallback_key and fallback_key in metrics:
-            value = metrics[fallback_key]
-        elif name == 'rmse' and 'mse' in metrics:
+        if name == 'rmse' and 'mse' in metrics:
             value = float(np.sqrt(metrics['mse']))
         else:
-            # Final fallback preference order
-            for k in ['r2', 'direction_accuracy', 'rmse', 'mse', 'mae', 'mape']:
+            for k in ['r2', 'direction_acc', 'rmse', 'mse', 'mae', 'mape']:
                 if k in metrics:
                     value = metrics[k]
                     name = k
                     break
             else:
-                # If nothing is available, return a neutral value
                 return 0.0
 
     # Determine optimization direction
-    maximize = name in {'r2', 'direction_accuracy'}
+    maximize = name in {'r2', 'direction_acc'}
     # For schedulers expecting a higher-is-better target, return as-is;
     # for lower-is-better, return the negative so larger is still better.
     return float(value if maximize else -value)
@@ -523,10 +559,6 @@ def simulate_shock(model, graph, shocked_nodes: List[str],
     
     # Create shock masks
     shock_mask_nodes = torch.zeros(graph.num_nodes, device=device)
-    # shocked_indices = [node_id_to_idx[node] for node in shocked_nodes]
-    # shock_mask_nodes[shocked_indices] = 1.0
-    
-    # For now, shock first N nodes as demonstration
     shock_mask_nodes[:len(shocked_nodes)] = 1.0
     
     # Baseline: predict without shock
@@ -668,6 +700,8 @@ def main():
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--train-edge-sample-ratio", type=float, default=0.3,
+                        help="Fraction of edges to sample per example during training (0-1)")
     
     # System
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -675,8 +709,10 @@ def main():
     parser.add_argument("--embeddings-dir", type=str, default="embeddings")
     parser.add_argument("--save-dir", type=str, default="models")
     parser.add_argument("--best-metric", type=str, default="r2",
-                        choices=['r2', 'rmse', 'mse', 'mae', 'mape', 'direction_accuracy', 'direction_acc'],
+                        choices=['r2', 'rmse', 'mse', 'mae', 'mape', 'direction_acc'],
                         help="Validation metric to optimize (default: r2)")
+    parser.add_argument("--sign-eps", type=float, default=1e-4,
+                        help="Epsilon threshold to treat small deltas as zero for direction accuracy")
 
     # Checkpoints
     parser.add_argument("--resume", type=str, default=None,
@@ -685,6 +721,10 @@ def main():
                        help="Automatically resume from latest checkpoint if it exists")
     
     args = parser.parse_args()
+
+    # Set global epsilon for sign comparisons
+    global SIGN_EPS
+    SIGN_EPS = args.sign_eps
     
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -726,10 +766,13 @@ def main():
     print(f"Val examples: {len(val_data)}")
     print(f"Test examples: {len(test_data)}")
     
-    # Model
-    sample = train_graphs[0]
-    node_dim = sample.x.shape[1]
-    edge_dim = sample.edge_attr.shape[1]
+    processed_example = load_and_process_example(
+        create_shock_training_data([train_years[0]], args.embeddings_dir, args.shock_threshold)[0],
+        args.device,
+        edge_sample_ratio=args.train_edge_sample_ratio,
+    )
+    node_dim = processed_example['graph'].x.shape[1]
+    edge_dim = processed_example['graph'].edge_attr.shape[1]
     
     print(f"\nModel dimensions:")
     print(f"  Node features: {node_dim}")
@@ -741,7 +784,7 @@ def main():
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
-        use_attention=False
+        use_attention=args.use_attention
     ).to(args.device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -770,22 +813,27 @@ def main():
     best_metric_value = -float('inf')
     prev_val_metrics = None
 
-    # Check for resume
+    # Check for resume flag
     if hasattr(args, 'resume') and args.resume:
         start_epoch, prev_val_metrics = load_checkpoint(
-            args.resume, model, optimizer, scheduler)
+            args.resume, model, optimizer, scheduler, args.device)
     elif hasattr(args, 'auto_resume') and args.auto_resume:
         latest_checkpoint = Path(save_dir) / "checkpoint_latest.pt"
         if latest_checkpoint.exists():
             start_epoch, prev_val_metrics = load_checkpoint(
-                latest_checkpoint, model, optimizer, scheduler)
+                latest_checkpoint, model, optimizer, scheduler, args.device)
     if prev_val_metrics:
         best_metric_value = get_best_metric(prev_val_metrics, args.best_metric)
     
     
     for epoch in range(start_epoch, args.epochs + 1):
-        train_metrics = train_epoch(model, optimizer, train_data, args.device, loss_fn)
-        val_metrics = evaluate(model, val_data, args.device)
+        train_metrics = train_epoch(
+            model, optimizer, train_data, args.device, loss_fn,
+            accumulation_steps=4, edge_sample_ratio=args.train_edge_sample_ratio
+        )
+        val_metrics = evaluate(
+            model, val_data, args.device
+        )
         
         scheduler.step(get_best_metric(val_metrics, args.best_metric))
         
@@ -799,7 +847,7 @@ def main():
         print(f"  Train Direction Acc: {train_metrics['direction_acc']:.2%}")
         print(f"  Val R²: {val_metrics['r2']:.4f}")
         print(f"  Val RMSE: {val_metrics['rmse']:.4f}")
-        print(f"  Val Direction Acc: {val_metrics['direction_accuracy']:.2%}")
+        print(f"  Val Direction Acc: {val_metrics['direction_acc']:.2%}")
         
         # Check for improvement
         current_metric_value = get_best_metric(val_metrics, args.best_metric)
@@ -838,10 +886,10 @@ def main():
     print(f"  Drop Detection F1: {test_metrics['drop_f1']:.3f}")
     print(f"  R²: {test_metrics['r2']:.3f}")
     print(f"  RMSE: {test_metrics['rmse']:.4f}")
-    print(f"  MAPE: {test_metrics['mape']:.1f}%")
+    print(f"  SMAPE: {test_metrics['smape']:.1f}%")
     
     # Save results
-    best_checkpoint = torch.load(save_dir / "best_model.pt")
+    best_checkpoint = torch.load(save_dir / "best_model.pt", weights_only=False)
     results = {
         'test_metrics': {k: float(v) for k, v in test_metrics.items()},
         'best_val_metrics': {k: float(v) for k, v in best_checkpoint['val_metrics'].items()},
@@ -866,7 +914,7 @@ def main():
         simulate_shock(
             model, 
             demo_graph,
-            shocked_nodes=['ECU_AGR'],  # Example: Ecuador agriculture
+            shocked_nodes=['ECU_AGR'], 
             shock_magnitude=0.5,  # 50% reduction
             device=args.device
         )

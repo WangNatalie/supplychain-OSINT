@@ -12,7 +12,7 @@ python training.py \
 
 python training.py \
   --use-attention \
-  --hidden-dim 128 --num-layers 3 --dropout 0.2 \
+  --hidden-dim 128 --num-layers 3 --dropout 0.1 \
   --loss hybrid --loss-alpha 0.5 --loss-gamma 1.5 \
   --lr 0.002 --weight-decay 1e-4 \
   --patience 20
