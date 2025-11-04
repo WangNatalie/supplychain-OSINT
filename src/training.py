@@ -23,7 +23,6 @@ from torch_geometric.nn import SAGEConv, BatchNorm, GATConv
 from torch_geometric.data import Data
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-import pandas as pd
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import argparse
 import json
@@ -34,6 +33,9 @@ import warnings
 import psutil
 import os
 warnings.filterwarnings('ignore')
+from loss_functions import get_loss_function
+from tqdm import tqdm
+import time
 
 def print_memory_usage(prefix=""):
     process = psutil.Process(os.getpid())
@@ -176,7 +178,7 @@ def load_graphs(years: List[int], embeddings_dir: str = "embeddings") -> List[Da
         if not path.exists():
             print(f"Warning: {path} not found, skipping year {year}")
             continue
-        graph = torch.load(path)
+        graph = torch.load(path, weights_only=False)
         graph.year = year
         
         # Verify required attributes
@@ -213,10 +215,10 @@ def extract_edge_values(graph: Data) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 def create_shock_training_data(graph_years: List[int], embeddings_dir: str, 
-                               shock_threshold: float = 0.15) -> List[Dict]:
+                              shock_threshold: float = 0.15) -> List[Dict]:
     """
-    Create training examples with lazy loading.
-    Only stores metadata, not full graphs.
+    Create training metadata and precompute shock masks once per graph.
+    Returns lightweight dicts with precomputed masks to avoid per-epoch recompute.
     """
     training_data = []
     
@@ -224,32 +226,60 @@ def create_shock_training_data(graph_years: List[int], embeddings_dir: str,
         path = Path(embeddings_dir) / f"graph_{year}_labeled.pt"
         if not path.exists():
             continue
-            
-        # Store path instead of loading graph
+        
+        # Load graph once to precompute masks
+        graph = torch.load(path, map_location='cpu', weights_only=False)
+        value_t, value_t1 = extract_edge_values(graph)
+        pct_change = (value_t1 - value_t) / (value_t + 1e-8)
+        shock_mask_edges = (pct_change < -shock_threshold).float()
+        
+        # Node shock mask: fraction of shocked outgoing edges > 0.2
+        src_idx, _ = graph.edge_index
+        num_nodes = graph.x.shape[0]
+        shocked_out_degree = torch.zeros(num_nodes)
+        shocked_out_degree.scatter_add_(0, src_idx, shock_mask_edges)
+        out_degree = torch.zeros(num_nodes)
+        out_degree.scatter_add_(0, src_idx, torch.ones_like(shock_mask_edges))
+        shock_mask_nodes = (shocked_out_degree / (out_degree + 1e-8) > 0.2).float()
+        
         training_data.append({
             'graph_path': str(path),
             'year': year,
-            'shock_threshold': shock_threshold
+            'shock_threshold': shock_threshold,
+            'shock_mask_edges': shock_mask_edges,  # precomputed
+            'shock_mask_nodes': shock_mask_nodes   # precomputed
         })
     
     return training_data
 
 
 def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0.3) -> Dict:
-    """Load graph and create shock annotations with edge sampling"""
-    graph = torch.load(example_metadata['graph_path'], map_location='cpu')
+    """Load graph and use precomputed shock annotations with edge sampling"""
+    graph = torch.load(example_metadata['graph_path'], map_location='cpu', weights_only=False)
     
     # Extract values
     value_t, value_t1 = extract_edge_values(graph)
+    
+    # Use precomputed shock masks
+    shock_mask_edges = example_metadata.get('shock_mask_edges')
+    shock_mask_nodes = example_metadata.get('shock_mask_nodes')
+    if shock_mask_edges is None or shock_mask_nodes is None:
+        # Fallback to on-the-fly computation (shouldn't happen once precomputed)
+        pct_change = (value_t1 - value_t) / (value_t + 1e-8)
+        shock_mask_edges = (pct_change < -example_metadata['shock_threshold']).float()
+        src_idx, _ = graph.edge_index
+        num_nodes = graph.x.shape[0]
+        shocked_out_degree = torch.zeros(num_nodes)
+        shocked_out_degree.scatter_add_(0, src_idx, shock_mask_edges)
+        out_degree = torch.zeros(num_nodes)
+        out_degree.scatter_add_(0, src_idx, torch.ones_like(shock_mask_edges))
+        shock_mask_nodes = (shocked_out_degree / (out_degree + 1e-8) > 0.2).float()
     
     # Sample edges to reduce memory
     num_edges = graph.edge_index.shape[1]
     num_sampled = int(num_edges * edge_sample_ratio)
     
     # Stratified sampling: keep all shocked edges + random sample of others
-    pct_change = (value_t1 - value_t) / (value_t + 1e-8)
-    shock_mask_edges = (pct_change < -example_metadata['shock_threshold']).float()
-    
     shocked_edge_idx = torch.where(shock_mask_edges > 0)[0]
     normal_edge_idx = torch.where(shock_mask_edges == 0)[0]
     
@@ -266,20 +296,13 @@ def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0
     value_t1 = value_t1[sampled_edge_idx]
     shock_mask_edges = shock_mask_edges[sampled_edge_idx]
     
-    # Compute node masks and deltas
+    # Compute deltas (node masks already precomputed)
     log_value_t = torch.log1p(value_t)
     log_value_t1 = torch.log1p(value_t1)
     delta_log_value = log_value_t1 - log_value_t
     
     src_idx, tgt_idx = graph.edge_index
     num_nodes = graph.x.shape[0]
-    
-    shocked_out_degree = torch.zeros(num_nodes)
-    shocked_out_degree.scatter_add_(0, src_idx, shock_mask_edges)
-    
-    out_degree = torch.zeros(num_nodes)
-    out_degree.scatter_add_(0, src_idx, torch.ones_like(shock_mask_edges))
-    shock_mask_nodes = (shocked_out_degree / (out_degree + 1e-8) > 0.2).float()
     
     return {
         'graph': graph.to(device),
@@ -292,22 +315,27 @@ def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0
     }
 
 
-def train_epoch(model, optimizer, training_metadata, device, accumulation_steps=4):
+def train_epoch(model, optimizer, training_metadata, device, loss_fn, accumulation_steps=4):
     """Train with gradient accumulation to reduce memory per step"""
     model.train()
     total_loss = 0
     total_samples = 0
+    total_direction_correct = 0
     
     optimizer.zero_grad()
     
-    for i, metadata in enumerate(training_metadata):
-        if i % 5 == 0:
-            print_memory_usage(f"   Step {i}/{len(training_metadata)} - ")
+    pbar = tqdm(enumerate(training_metadata), total=len(training_metadata), 
+                desc="Training", leave=False)
+    
+    for i, metadata in pbar:
+        step_start = time.time()
             
         # Load graph only when needed
         example = load_and_process_example(metadata, device)
-        
+        load_time = time.time() - step_start
+
         # Forward pass
+        forward_start = time.time()
         predictions = model(
             example['graph'].x, 
             example['graph'].edge_index, 
@@ -316,16 +344,33 @@ def train_epoch(model, optimizer, training_metadata, device, accumulation_steps=
             example['shock_mask_edges']
         )
         
-        loss = F.mse_loss(predictions, example['target'])
-        loss = loss + 0.01 * F.l1_loss(predictions, example['target'])
-        
-        # Scale loss by accumulation steps
+        if hasattr(loss_fn, 'name') and loss_fn.name.startswith("WeightedSign"):
+            loss = loss_fn(predictions, example['target'], example['value_t'])
+        else:
+            loss = loss_fn(predictions, example['target'])
+
         loss = loss / accumulation_steps
+        forward_time = time.time() - forward_start
+
+        backward_start = time.time()
         loss.backward()
+        backward_time = time.time() - backward_start
+        
+        # Track direction accuracy
+        with torch.no_grad():
+            direction_correct = (torch.sign(predictions) == torch.sign(example['target'])).float().mean()
+            total_direction_correct += direction_correct.item() * len(example['target'])
         
         total_loss += loss.item() * len(example['target']) * accumulation_steps
         total_samples += len(example['target'])
         
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'load': f'{load_time:.2f}s',
+            'fwd': f'{forward_time:.2f}s',
+            'bwd': f'{backward_time:.2f}s'
+        })
+
         # Explicitly delete to free memory
         del example, predictions
         
@@ -341,7 +386,10 @@ def train_epoch(model, optimizer, training_metadata, device, accumulation_steps=
         optimizer.step()
         optimizer.zero_grad()
     
-    return total_loss / total_samples
+    return {
+        'loss': total_loss / total_samples,
+        'direction_acc': total_direction_correct / total_samples
+    }
 
 
 @torch.no_grad()
@@ -354,8 +402,8 @@ def evaluate(model, training_metadata, device) -> Dict[str, float]:
     all_values_t = []
     all_values_t1_true = []
     
-    for metadata in training_metadata:  # Changed from training_data
-        # Load example on-demand
+    for metadata in training_metadata:  
+
         example = load_and_process_example(metadata, device)
         
         predictions = model(
@@ -403,6 +451,46 @@ def evaluate(model, training_metadata, device) -> Dict[str, float]:
         'mape': mape,
         'direction_accuracy': direction_correct
     }
+
+
+def get_best_metric(metrics: Dict[str, float], metric_name: str) -> float:
+    """
+    Return the scalar to optimize for validation scheduling/early stopping.
+    Higher-is-better metrics: r2, direction_accuracy
+    Lower-is-better metrics: mse, rmse, mae, mape
+    Falls back gracefully if the requested metric is missing.
+    """
+    name = (metric_name or "r2").lower()
+
+    # Try direct hit first
+    if name in metrics:
+        value = metrics[name]
+    else:
+        # Friendly aliases
+        alias_map = {
+            'direction_acc': 'direction_accuracy',
+        }
+        fallback_key = alias_map.get(name)
+        if fallback_key and fallback_key in metrics:
+            value = metrics[fallback_key]
+        elif name == 'rmse' and 'mse' in metrics:
+            value = float(np.sqrt(metrics['mse']))
+        else:
+            # Final fallback preference order
+            for k in ['r2', 'direction_accuracy', 'rmse', 'mse', 'mae', 'mape']:
+                if k in metrics:
+                    value = metrics[k]
+                    name = k
+                    break
+            else:
+                # If nothing is available, return a neutral value
+                return 0.0
+
+    # Determine optimization direction
+    maximize = name in {'r2', 'direction_accuracy'}
+    # For schedulers expecting a higher-is-better target, return as-is;
+    # for lower-is-better, return the negative so larger is still better.
+    return float(value if maximize else -value)
 
 
 def simulate_shock(model, graph, shocked_nodes: List[str], 
@@ -489,6 +577,59 @@ def simulate_shock(model, graph, shocked_nodes: List[str],
     
     return results
 
+def save_checkpoint(epoch, model, optimizer, scheduler, val_metrics, args, save_dir, is_best=False):
+    """Save training checkpoint with all state needed to resume"""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'val_metrics': val_metrics,
+        'args': vars(args),
+        'best_val_r2': getattr(save_checkpoint, 'best_val_r2', -float('inf')),
+        'patience_counter': getattr(save_checkpoint, 'patience_counter', 0)
+    }
+    
+    # Save latest checkpoint
+    latest_path = save_dir / "checkpoint_latest.pt"
+    torch.save(checkpoint, latest_path)
+    
+    # Save best model separately
+    if is_best:
+        torch.save(checkpoint, save_dir / "best_model.pt")
+    
+    # Optionally save periodic backups every N epochs
+    if epoch % 5 == 0:
+        torch.save(checkpoint, save_dir / f"checkpoint_epoch_{epoch}.pt")
+
+# Attach state to function object for tracking across calls
+save_checkpoint.best_val_r2 = -float('inf')
+save_checkpoint.patience_counter = 0
+
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
+    """Load checkpoint and restore training state"""
+    print(f"\nLoading checkpoint from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    start_epoch = checkpoint['epoch'] + 1
+    best_val_r2 = checkpoint.get('best_val_r2', -float('inf'))
+    patience_counter = checkpoint.get('patience_counter', 0)
+    
+    # Restore function state
+    save_checkpoint.best_val_r2 = best_val_r2
+    save_checkpoint.patience_counter = patience_counter
+    
+    print(f"✓ Resumed from epoch {checkpoint['epoch']}")
+    print(f"  Best val R²: {best_val_r2:.4f}")
+    print(f"  Patience counter: {patience_counter}/{checkpoint['args'].get('patience', 15)}")
+    
+    return start_epoch, best_val_r2, patience_counter
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -504,11 +645,23 @@ def main():
                        help="Threshold for identifying natural shocks (default: 15%% drop)")
     
     # Model
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--use-attention", action="store_true",
                        help="Use GAT instead of GraphSAGE for attention mechanism")
+
+    # Loss
+    parser.add_argument("--loss", type=str, default="mse",
+                   choices=['mse', 'huber', 'sign_corrected', 'weighted_sign', 
+                           'focal', 'hybrid', 'asymmetric'],
+                   help="Loss function type")
+    parser.add_argument("--loss-alpha", type=float, default=1.0,
+                    help="Alpha parameter for sign-corrected losses")
+    parser.add_argument("--loss-delta", type=float, default=0.1,
+                    help="Delta parameter for Huber loss")
+    parser.add_argument("--loss-gamma", type=float, default=1.5,
+                    help="Gamma parameter for focal losses")
     
     # Training
     parser.add_argument("--epochs", type=int, default=100)
@@ -520,7 +673,16 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--embeddings-dir", type=str, default="embeddings")
-    parser.add_argument("--save-dir", type=str, default="models/shock_propagation")
+    parser.add_argument("--save-dir", type=str, default="models")
+    parser.add_argument("--best-metric", type=str, default="r2",
+                        choices=['r2', 'rmse', 'mse', 'mae', 'mape', 'direction_accuracy', 'direction_acc'],
+                        help="Validation metric to optimize (default: r2)")
+
+    # Checkpoints
+    parser.add_argument("--resume", type=str, default=None,
+                       help="Path to checkpoint to resume from (default: auto-detect latest)")
+    parser.add_argument("--auto-resume", action="store_true",
+                       help="Automatically resume from latest checkpoint if it exists")
     
     args = parser.parse_args()
     
@@ -579,80 +741,111 @@ def main():
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
-        use_attention=args.use_attention
+        use_attention=False
     ).to(args.device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True
+        optimizer, mode='max', factor=0.5, patience=5
     )
+
+    if args.loss == 'huber':
+        loss_fn = get_loss_function('huber', delta=args.loss_delta)
+    elif args.loss == 'sign_corrected':
+        loss_fn = get_loss_function('sign_corrected', alpha=args.loss_alpha)
+    elif args.loss == 'focal':
+        loss_fn = get_loss_function('focal', gamma=args.loss_gamma)
+    elif args.loss == 'hybrid':
+        loss_fn = get_loss_function('hybrid', alpha=args.loss_alpha, gamma=args.loss_gamma)
+    else:
+        loss_fn = get_loss_function(args.loss)
     
     # Training loop
     print("\nTraining...")
-    best_val_r2 = -float('inf')
+    start_epoch = 1
     best_epoch = 0
     patience_counter = 0
+    best_metric_value = -float('inf')
+    prev_val_metrics = None
+
+    # Check for resume
+    if hasattr(args, 'resume') and args.resume:
+        start_epoch, prev_val_metrics = load_checkpoint(
+            args.resume, model, optimizer, scheduler)
+    elif hasattr(args, 'auto_resume') and args.auto_resume:
+        latest_checkpoint = Path(save_dir) / "checkpoint_latest.pt"
+        if latest_checkpoint.exists():
+            start_epoch, prev_val_metrics = load_checkpoint(
+                latest_checkpoint, model, optimizer, scheduler)
+    if prev_val_metrics:
+        best_metric_value = get_best_metric(prev_val_metrics, args.best_metric)
     
-    for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(model, optimizer, train_data, args.device)
+    
+    for epoch in range(start_epoch, args.epochs + 1):
+        train_metrics = train_epoch(model, optimizer, train_data, args.device, loss_fn)
         val_metrics = evaluate(model, val_data, args.device)
         
-        scheduler.step(val_metrics['r2'])
+        scheduler.step(get_best_metric(val_metrics, args.best_metric))
         
-        writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('Loss/train', train_metrics['loss'], epoch)
+        writer.add_scalar('Direction Accuracy/train', train_metrics['direction_acc'], epoch)
         for k, v in val_metrics.items():
             writer.add_scalar(f'Metrics/val_{k}', v, epoch)
         
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"\nEpoch {epoch:3d}/{args.epochs}")
-            print(f"  Train Loss: {train_loss:.4f}")
-            print(f"  Val R²: {val_metrics['r2']:.4f}")
-            print(f"  Val RMSE: {val_metrics['rmse']:.4f}")
-            print(f"  Val Direction Acc: {val_metrics['direction_accuracy']:.2%}")
+        print(f"\nEpoch {epoch:3d}/{args.epochs}")
+        print(f"  Train Loss: {train_metrics['loss']:.4f}")
+        print(f"  Train Direction Acc: {train_metrics['direction_acc']:.2%}")
+        print(f"  Val R²: {val_metrics['r2']:.4f}")
+        print(f"  Val RMSE: {val_metrics['rmse']:.4f}")
+        print(f"  Val Direction Acc: {val_metrics['direction_accuracy']:.2%}")
         
-        if val_metrics['r2'] > best_val_r2:
-            best_val_r2 = val_metrics['r2']
+        # Check for improvement
+        current_metric_value = get_best_metric(val_metrics, args.best_metric)
+        is_best = current_metric_value > best_metric_value
+        if is_best:
+            best_metric_value = current_metric_value
             best_epoch = epoch
             patience_counter = 0
-            
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_metrics': val_metrics,
-                'args': vars(args)
-            }, save_dir / "best_model.pt")
-            print(f"  ✓ Best model saved (R²: {best_val_r2:.4f})")
+            print(f"    ✓ New best {args.best_metric}: {best_metric_value:.4f}")
         else:
             patience_counter += 1
-            if patience_counter >= args.patience:
-                print(f"\nEarly stopping at epoch {epoch}")
-                break
+        
+        # Save checkpoint
+        save_checkpoint(epoch, model, optimizer, scheduler, val_metrics, args, save_dir, is_best)
+        
+        # Early stopping check
+        if patience_counter >= args.patience:
+            print(f"\nEarly stopping at epoch {epoch}")
+            print(f"Best {args.best_metric} was {best_metric_value:.4f} at epoch {best_epoch}")
+            break
     
     # Final evaluation
     print("\n" + "="*70)
     print("FINAL EVALUATION")
     print("="*70)
     
-    checkpoint = torch.load(save_dir / "best_model.pt")
+    checkpoint = torch.load(save_dir / "best_model.pt", weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     
     test_metrics = evaluate(model, test_data, args.device)
     
     print(f"\nTest Set Performance:")
-    print(f"  R²: {test_metrics['r2']:.4f}")
+    print(f"  Direction Accuracy: {test_metrics['direction_acc']:.2%}")
+    print(f"    - Gains: {test_metrics['gain_dir_acc']:.2%}")
+    print(f"    - Drops: {test_metrics['drop_dir_acc']:.2%}")
+    print(f"  Drop Detection F1: {test_metrics['drop_f1']:.3f}")
+    print(f"  R²: {test_metrics['r2']:.3f}")
     print(f"  RMSE: {test_metrics['rmse']:.4f}")
-    print(f"  MAE: {test_metrics['mae']:.4f}")
-    print(f"  MAPE: {test_metrics['mape']:.2f}%")
-    print(f"  Direction Accuracy: {test_metrics['direction_accuracy']:.2%}")
+    print(f"  MAPE: {test_metrics['mape']:.1f}%")
     
     # Save results
+    best_checkpoint = torch.load(save_dir / "best_model.pt")
     results = {
-        'test_metrics': test_metrics,
-        'val_metrics': checkpoint['val_metrics'],
-        'best_epoch': best_epoch,
+        'test_metrics': {k: float(v) for k, v in test_metrics.items()},
+        'best_val_metrics': {k: float(v) for k, v in best_checkpoint['val_metrics'].items()},
+        'best_epoch': best_checkpoint['epoch'],
         'args': vars(args)
     }
     
