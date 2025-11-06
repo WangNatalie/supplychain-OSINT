@@ -27,7 +27,19 @@ model = ShockPropagationGNN(
     dropout=ckpt_args.get('dropout', 0.3),
     use_attention=ckpt_args.get('use_attention', True)
 )
-model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+
+# Map old checkpoint keys to new model architecture
+# Old model had edge_mlp.7 as final layer, new has edge_mlp.6
+state_dict = checkpoint['model_state_dict']
+new_state_dict = {}
+for key, value in state_dict.items():
+    if key.startswith('edge_mlp.7.'):
+        new_key = key.replace('edge_mlp.7.', 'edge_mlp.6.')
+        new_state_dict[new_key] = value
+    else:
+        new_state_dict[key] = value
+
+model.load_state_dict(new_state_dict, strict=False)
 model.eval()
 
 # Get predictions

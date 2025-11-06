@@ -391,7 +391,16 @@ def main():
         use_attention=model_args.get('use_attention', False)
     ).to(args.device)
     
-    model.load_state_dict(checkpoint['model_state_dict'])
+    state_dict = checkpoint['model_state_dict']
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith('edge_mlp.7.'):
+            new_key = key.replace('edge_mlp.7.', 'edge_mlp.6.')
+            new_state_dict[new_key] = value
+        else:
+            new_state_dict[key] = value
+    
+    model.load_state_dict(new_state_dict, strict=False)
     print(f"✓ Model loaded (trained for {checkpoint['epoch']} epochs)")
     
     # Initialize simulator

@@ -85,13 +85,12 @@ class ShockPropagationGNN(torch.nn.Module):
             torch.nn.Dropout(dropout)
         )
         
-        # Graph convolution layers (use GAT for attention to shocked nodes)
+        # Graph convolution layers
         self.convs = torch.nn.ModuleList()
         self.batch_norms = torch.nn.ModuleList()
         
         for i in range(num_layers):
             if use_attention:
-                # GAT: learns to attend to shocked/important nodes
                 self.convs.append(GATConv(hidden_dim, hidden_dim, heads=4, concat=False))
             else:
                 self.convs.append(SAGEConv(hidden_dim, hidden_dim))
@@ -106,13 +105,11 @@ class ShockPropagationGNN(torch.nn.Module):
             torch.nn.ReLU(),
             torch.nn.Dropout(dropout),
             torch.nn.Linear(hidden_dim, hidden_dim // 2),
-            torch.nn.Tanh(),  # Changed from ReLU to allow negative predictions
             torch.nn.Dropout(dropout),
-            torch.nn.Linear(hidden_dim // 2, 1)  # Predict Δlog(value)
+            torch.nn.Linear(hidden_dim // 2, 1)
         )
         
-        # Learnable output scaling to match target range
-        self.output_scale = torch.nn.Parameter(torch.ones(1) * 2.0)
+        self.output_scale = torch.nn.Parameter(torch.ones(1) * 4.0)
         self.output_bias = torch.nn.Parameter(torch.zeros(1))
     
     def forward(self, x, edge_index, edge_attr, shock_mask_nodes=None, shock_mask_edges=None):
@@ -629,10 +626,6 @@ def save_checkpoint(epoch, model, optimizer, scheduler, val_metrics, args, save_
     # Save best model separately
     if is_best:
         torch.save(checkpoint, save_dir / "best_model.pt")
-    
-    # Optionally save periodic backups every N epochs
-    if epoch % 5 == 0:
-        torch.save(checkpoint, save_dir / f"checkpoint_epoch_{epoch}.pt")
 
 # Attach state to function object for tracking across calls
 save_checkpoint.best_val_r2 = -float('inf')
@@ -686,7 +679,7 @@ def main():
     # Loss
     parser.add_argument("--loss", type=str, default="mse",
                    choices=['mse', 'huber', 'sign_corrected', 'weighted_sign', 
-                           'focal', 'hybrid', 'asymmetric'],
+                           'focal', 'hybrid', 'asymmetric', 'imbalanced'],
                    help="Loss function type")
     parser.add_argument("--loss-alpha", type=float, default=1.0,
                     help="Alpha parameter for sign-corrected losses")
@@ -694,6 +687,10 @@ def main():
                     help="Delta parameter for Huber loss")
     parser.add_argument("--loss-gamma", type=float, default=1.5,
                     help="Gamma parameter for focal losses")
+    parser.add_argument("--loss-alpha-wrong-common", type=float, default=3.0,
+                    help="Penalty for common errors - predict gain when should drop (imbalanced loss)")
+    parser.add_argument("--loss-alpha-wrong-rare", type=float, default=10.0,
+                    help="Penalty for rare errors - predict drop when should gain (imbalanced loss)")
     
     # Training
     parser.add_argument("--epochs", type=int, default=100)
@@ -802,6 +799,11 @@ def main():
         loss_fn = get_loss_function('focal', gamma=args.loss_gamma)
     elif args.loss == 'hybrid':
         loss_fn = get_loss_function('hybrid', alpha=args.loss_alpha, gamma=args.loss_gamma)
+    elif args.loss == 'imbalanced':
+        loss_fn = get_loss_function('imbalanced', 
+                                   alpha_correct=args.loss_alpha,
+                                   alpha_wrong_common=args.loss_alpha_wrong_common,
+                                   alpha_wrong_rare=args.loss_alpha_wrong_rare)
     else:
         loss_fn = get_loss_function(args.loss)
     
@@ -914,7 +916,7 @@ def main():
         simulate_shock(
             model, 
             demo_graph,
-            shocked_nodes=['ECU_AGR'], 
+            shocked_nodes=['ECU_A01'], 
             shock_magnitude=0.5,  # 50% reduction
             device=args.device
         )

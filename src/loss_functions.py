@@ -35,27 +35,6 @@ class MSELoss(nn.Module):
         return F.mse_loss(pred, target)
 
 
-class HuberLoss(nn.Module):
-    """
-    Huber loss - robust to outliers.
-    
-    Behaves like MSE for small errors, L1 for large errors.
-    Good for: Data with occasional extreme outliers
-    
-    Args:
-        delta: Threshold between L2 and L1 behavior (default: 0.1)
-               Smaller delta = more robust to outliers
-    """
-    
-    def __init__(self, delta=0.1):
-        super().__init__()
-        self.delta = delta
-        self.name = f"Huber(δ={delta})"
-    
-    def forward(self, pred, target):
-        return F.huber_loss(pred, target, delta=self.delta)
-
-
 class SignCorrectedMSELoss(nn.Module):
     """
     MSE with exponential penalty for wrong direction predictions.
@@ -232,39 +211,6 @@ class HybridSignFocalLoss(nn.Module):
         
         return (squared_error * focal_weight * sign_weight).mean()
 
-
-class AsymmetricLoss(nn.Module):
-    """
-    Asymmetric loss - penalize drops more than gains.
-    
-    Useful for supply chain risk where disruptions matter more than growth.
-    
-    Loss = MSE * weight
-    where weight = drop_weight if predicting/actual is drop, else 1.0
-    
-    Args:
-        drop_weight: Extra penalty for drop predictions (default: 2.0)
-                    2.0 = drops are 2x more important than gains
-    
-    Good for: When you care more about predicting disruptions correctly
-    """
-    
-    def __init__(self, drop_weight=2.0):
-        super().__init__()
-        self.drop_weight = drop_weight
-        self.name = f"Asymmetric(drop={drop_weight}x)"
-    
-    def forward(self, pred, target):
-        # Base MSE
-        mse = (pred - target) ** 2
-        
-        # Extra weight for drops (either predicted or actual)
-        is_drop = ((pred < 0) | (target < 0)).float()
-        weights = 1.0 + is_drop * (self.drop_weight - 1.0)
-        
-        return (mse * weights).mean()
-
-
 # ============================================================================
 # HELPER FUNCTION FOR EASY USE
 # ============================================================================
@@ -275,18 +221,15 @@ def get_loss_function(loss_type='mse', **kwargs):
     
     Usage:
         loss_fn = get_loss_function('sign_corrected', alpha=1.0)
-        loss_fn = get_loss_function('huber', delta=0.1)
         loss_fn = get_loss_function('focal', gamma=2.0)
     
     Available losses:
         'mse': Standard MSE
-        'huber': Huber loss (robust to outliers)
         'sign_corrected': MSE with direction penalty
         'weighted_sign': Sign-corrected with value weighting
         'focal': Focal regression loss
         'hybrid': Sign correction + focal weighting
-        'asymmetric': Extra penalty for drops
-    
+        
     Args:
         loss_type: Name of loss function
         **kwargs: Parameters for the loss function
@@ -297,12 +240,10 @@ def get_loss_function(loss_type='mse', **kwargs):
     
     loss_registry = {
         'mse': MSELoss,
-        'huber': HuberLoss,
         'sign_corrected': SignCorrectedMSELoss,
         'weighted_sign': WeightedSignCorrectedMSELoss,
         'focal': FocalRegressionLoss,
         'hybrid': HybridSignFocalLoss,
-        'asymmetric': AsymmetricLoss,
     }
     
     if loss_type not in loss_registry:
@@ -333,13 +274,11 @@ def compare_losses(pred, target, value_t=None):
     
     losses = {
         'MSE': MSELoss(),
-        'Huber(0.1)': HuberLoss(delta=0.1),
         'SignMSE(α=0.5)': SignCorrectedMSELoss(alpha=0.5),
         'SignMSE(α=1.0)': SignCorrectedMSELoss(alpha=1.0),
         'SignMSE(α=2.0)': SignCorrectedMSELoss(alpha=2.0),
         'Focal(γ=1.0)': FocalRegressionLoss(gamma=1.0),
         'Hybrid': HybridSignFocalLoss(),
-        'Asymmetric': AsymmetricLoss(),
     }
     
     print("\n" + "="*60)
