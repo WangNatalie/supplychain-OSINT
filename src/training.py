@@ -211,10 +211,21 @@ def extract_edge_values(graph: Data) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 def create_shock_training_data(graph_years: List[int], embeddings_dir: str, 
-                              shock_threshold: float = 0.15) -> List[Dict]:
+                              shock_threshold: float = 0.15,
+                              balanced_sampling: bool = False,
+                              balance_ratio: float = 1.0) -> List[Dict]:
     """
     Create training metadata and precompute shock masks once per graph.
-    Returns lightweight dicts with precomputed masks to avoid per-epoch recompute.
+    
+    Args:
+        graph_years: Years to process
+        embeddings_dir: Directory with graph files
+        shock_threshold: Threshold for shock identification
+        balanced_sampling: If True, create balanced gain/drop indices
+        balance_ratio: Ratio of gains to drops (1.0 = equal, only used if balanced_sampling=True)
+    
+    Returns:
+        List of metadata dicts with precomputed masks and optional balanced indices
     """
     training_data = []
     
@@ -238,19 +249,75 @@ def create_shock_training_data(graph_years: List[int], embeddings_dir: str,
         out_degree.scatter_add_(0, src_idx, torch.ones_like(shock_mask_edges))
         shock_mask_nodes = (shocked_out_degree / (out_degree + 1e-8) > 0.2).float()
         
-        training_data.append({
+        metadata = {
             'graph_path': str(path),
             'year': year,
             'shock_threshold': shock_threshold,
-            'shock_mask_edges': shock_mask_edges,  # precomputed
-            'shock_mask_nodes': shock_mask_nodes   # precomputed
-        })
+            'shock_mask_edges': shock_mask_edges,
+            'shock_mask_nodes': shock_mask_nodes
+        }
+        
+        # Add balanced sampling indices if requested
+        if balanced_sampling:
+            delta_log = torch.log1p(value_t1) - torch.log1p(value_t)
+            
+            # Classify edges
+            gain_mask = delta_log > SIGN_EPS
+            drop_mask = delta_log < -SIGN_EPS
+            neutral_mask = torch.abs(delta_log) <= SIGN_EPS
+            
+            gain_idx = torch.where(gain_mask)[0]
+            drop_idx = torch.where(drop_mask)[0]
+            neutral_idx = torch.where(neutral_mask)[0]
+            
+            n_gains = len(gain_idx)
+            n_drops = len(drop_idx)
+            
+            # Sample to achieve balance_ratio
+            if balance_ratio == 1.0:
+                # Equal gains and drops
+                n_target = min(n_gains, n_drops)
+                sampled_gain_idx = gain_idx[torch.randperm(n_gains)[:n_target]]
+                sampled_drop_idx = drop_idx[torch.randperm(n_drops)[:n_target]]
+            else:
+                # Custom ratio
+                n_target = min(n_gains, int(n_drops * balance_ratio))
+                sampled_gain_idx = gain_idx[torch.randperm(n_gains)[:n_target]]
+                sampled_drop_idx = drop_idx[torch.randperm(n_drops)[:int(n_target/balance_ratio)]]
+            
+            # Add some neutral edges (10% of balanced set)
+            n_neutral = int(len(sampled_gain_idx) * 0.1)
+            sampled_neutral_idx = neutral_idx[torch.randperm(len(neutral_idx))[:n_neutral]] if len(neutral_idx) > 0 else torch.tensor([])
+            
+            # Combine and ensure long type for indexing
+            balanced_edge_idx = torch.cat([sampled_gain_idx, sampled_drop_idx, sampled_neutral_idx]).long()
+            
+            metadata['balanced_edge_idx'] = balanced_edge_idx
+            metadata['n_gains_sampled'] = len(sampled_gain_idx)
+            metadata['n_drops_sampled'] = len(sampled_drop_idx)
+            
+            if balanced_sampling:
+                print(f"  Year {year}: Original {n_gains}G/{n_drops}D → Sampled {len(sampled_gain_idx)}G/{len(sampled_drop_idx)}D")
+        
+        training_data.append(metadata)
     
     return training_data
 
 
-def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0.3) -> Dict:
-    """Load graph and use precomputed shock annotations with edge sampling"""
+def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0.3, 
+                            use_balanced=True) -> Dict:
+    """
+    Load graph and use precomputed shock annotations with edge sampling.
+    
+    Args:
+        example_metadata: Metadata dict with graph path and masks
+        device: Device to load tensors to
+        edge_sample_ratio: Ratio of edges to sample (if not using balanced indices)
+        use_balanced: If True and balanced_edge_idx exists, use balanced sampling
+    
+    Returns:
+        Dict with graph data, masks, and targets
+    """
     graph = torch.load(example_metadata['graph_path'], map_location='cpu', weights_only=False)
     
     # Extract values
@@ -271,19 +338,31 @@ def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0
         out_degree.scatter_add_(0, src_idx, torch.ones_like(shock_mask_edges))
         shock_mask_nodes = (shocked_out_degree / (out_degree + 1e-8) > 0.2).float()
     
-    # Sample edges to reduce memory
-    num_edges = graph.edge_index.shape[1]
-    num_sampled = int(num_edges * edge_sample_ratio)
-    
-    # Stratified sampling: keep all shocked edges + random sample of others
-    shocked_edge_idx = torch.where(shock_mask_edges > 0)[0]
-    normal_edge_idx = torch.where(shock_mask_edges == 0)[0]
-    
-    # Keep all shocked edges
-    num_normal_to_sample = max(0, num_sampled - len(shocked_edge_idx))
-    sampled_normal_idx = normal_edge_idx[torch.randperm(len(normal_edge_idx))[:num_normal_to_sample]]
-    
-    sampled_edge_idx = torch.cat([shocked_edge_idx, sampled_normal_idx])
+    # Choose sampling strategy
+    if use_balanced and 'balanced_edge_idx' in example_metadata:
+        # Use precomputed balanced indices
+        balanced_idx = example_metadata['balanced_edge_idx']
+        
+        # Further subsample if needed
+        if edge_sample_ratio < 1.0:
+            n_sample = int(len(balanced_idx) * edge_sample_ratio)
+            subsample_idx = torch.randperm(len(balanced_idx))[:n_sample]
+            sampled_edge_idx = balanced_idx[subsample_idx].long()
+        else:
+            sampled_edge_idx = balanced_idx.long()
+    else:
+        # Original stratified sampling: keep all shocked edges + random sample of others
+        num_edges = graph.edge_index.shape[1]
+        num_sampled = int(num_edges * edge_sample_ratio)
+        
+        shocked_edge_idx = torch.where(shock_mask_edges > 0)[0]
+        normal_edge_idx = torch.where(shock_mask_edges == 0)[0]
+        
+        # Keep all shocked edges
+        num_normal_to_sample = max(0, num_sampled - len(shocked_edge_idx))
+        sampled_normal_idx = normal_edge_idx[torch.randperm(len(normal_edge_idx))[:num_normal_to_sample]]
+        
+        sampled_edge_idx = torch.cat([shocked_edge_idx, sampled_normal_idx]).long()
     
     # Subsample graph
     graph.edge_index = graph.edge_index[:, sampled_edge_idx]
@@ -326,8 +405,10 @@ def train_epoch(model, optimizer, training_metadata, device, loss_fn, accumulati
     for i, metadata in pbar:
         step_start = time.time()
             
-        # Load graph only when needed
-        example = load_and_process_example(metadata, device, edge_sample_ratio=edge_sample_ratio)
+        # Load graph only when needed (use balanced sampling if available)
+        example = load_and_process_example(metadata, device, 
+                                          edge_sample_ratio=edge_sample_ratio,
+                                          use_balanced=True)
         load_time = time.time() - step_start
 
         # Forward pass
@@ -404,7 +485,10 @@ def evaluate(model, training_metadata, device, edge_sample_ratio=1.0) -> Dict[st
     
     for metadata in training_metadata:  
 
-        example = load_and_process_example(metadata, device, edge_sample_ratio=edge_sample_ratio)
+        # Don't use balanced sampling for evaluation - use full unbalanced data
+        example = load_and_process_example(metadata, device, 
+                                          edge_sample_ratio=edge_sample_ratio,
+                                          use_balanced=False)
         
         predictions = model(
             example['graph'].x,
@@ -678,19 +762,13 @@ def main():
 
     # Loss
     parser.add_argument("--loss", type=str, default="mse",
-                   choices=['mse', 'huber', 'sign_corrected', 'weighted_sign', 
-                           'focal', 'hybrid', 'asymmetric', 'imbalanced'],
+                   choices=['mse', 'sign_corrected', 'weighted_sign', 
+                           'focal', 'hybrid'],
                    help="Loss function type")
     parser.add_argument("--loss-alpha", type=float, default=1.0,
                     help="Alpha parameter for sign-corrected losses")
-    parser.add_argument("--loss-delta", type=float, default=0.1,
-                    help="Delta parameter for Huber loss")
     parser.add_argument("--loss-gamma", type=float, default=1.5,
                     help="Gamma parameter for focal losses")
-    parser.add_argument("--loss-alpha-wrong-common", type=float, default=3.0,
-                    help="Penalty for common errors - predict gain when should drop (imbalanced loss)")
-    parser.add_argument("--loss-alpha-wrong-rare", type=float, default=10.0,
-                    help="Penalty for rare errors - predict drop when should gain (imbalanced loss)")
     
     # Training
     parser.add_argument("--epochs", type=int, default=100)
@@ -699,6 +777,10 @@ def main():
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--train-edge-sample-ratio", type=float, default=0.3,
                         help="Fraction of edges to sample per example during training (0-1)")
+    parser.add_argument("--balanced-sampling", action="store_true",
+                        help="Use balanced gain/drop sampling (addresses temporal imbalance)")
+    parser.add_argument("--balance-ratio", type=float, default=1.0,
+                        help="Ratio of gains to drops in training (1.0 = equal, only used with --balanced-sampling)")
     
     # System
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -739,6 +821,8 @@ def main():
     print(f"Val: {args.val_start}-{args.val_end}")
     print(f"Test: {args.test_start}-{args.test_end}")
     print(f"Shock threshold: {args.shock_threshold:.1%}")
+    if args.balanced_sampling:
+        print(f"Balanced sampling: ENABLED (ratio {args.balance_ratio}:1 gains:drops)")
     print("="*70)
     
     # Load graphs
@@ -754,10 +838,23 @@ def main():
     print(f"Loaded {len(train_graphs)} train, {len(val_graphs)} val, {len(test_graphs)} test graphs")
     
     # Create training data with shock annotations
-    print("\nAnnotating natural shocks in historical data...")
-    train_data = create_shock_training_data(train_years, args.embeddings_dir, args.shock_threshold)
-    val_data = create_shock_training_data(val_years, args.embeddings_dir, args.shock_threshold)
-    test_data = create_shock_training_data(test_years, args.embeddings_dir, args.shock_threshold)
+    if args.balanced_sampling:
+        print("\nCreating balanced training data...")
+    else:
+        print("\nAnnotating natural shocks in historical data...")
+    train_data = create_shock_training_data(
+        train_years, args.embeddings_dir, args.shock_threshold,
+        balanced_sampling=args.balanced_sampling,
+        balance_ratio=args.balance_ratio
+    )
+    val_data = create_shock_training_data(
+        val_years, args.embeddings_dir, args.shock_threshold,
+        balanced_sampling=False  # Always unbalanced for validation
+    )
+    test_data = create_shock_training_data(
+        test_years, args.embeddings_dir, args.shock_threshold,
+        balanced_sampling=False  # Always unbalanced for test
+    )
     
     print(f"Train examples: {len(train_data)}")
     print(f"Val examples: {len(val_data)}")
@@ -767,6 +864,7 @@ def main():
         create_shock_training_data([train_years[0]], args.embeddings_dir, args.shock_threshold)[0],
         args.device,
         edge_sample_ratio=args.train_edge_sample_ratio,
+        use_balanced=False  # Just getting dimensions
     )
     node_dim = processed_example['graph'].x.shape[1]
     edge_dim = processed_example['graph'].edge_attr.shape[1]
@@ -791,19 +889,12 @@ def main():
         optimizer, mode='max', factor=0.5, patience=5
     )
 
-    if args.loss == 'huber':
-        loss_fn = get_loss_function('huber', delta=args.loss_delta)
-    elif args.loss == 'sign_corrected':
+    if args.loss == 'sign_corrected':
         loss_fn = get_loss_function('sign_corrected', alpha=args.loss_alpha)
     elif args.loss == 'focal':
         loss_fn = get_loss_function('focal', gamma=args.loss_gamma)
     elif args.loss == 'hybrid':
         loss_fn = get_loss_function('hybrid', alpha=args.loss_alpha, gamma=args.loss_gamma)
-    elif args.loss == 'imbalanced':
-        loss_fn = get_loss_function('imbalanced', 
-                                   alpha_correct=args.loss_alpha,
-                                   alpha_wrong_common=args.loss_alpha_wrong_common,
-                                   alpha_wrong_rare=args.loss_alpha_wrong_rare)
     else:
         loss_fn = get_loss_function(args.loss)
     

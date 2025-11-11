@@ -1,20 +1,28 @@
 python training.py \
   --use-attention \
-  --hidden-dim 128 --num-layers 3 --dropout 0.1 \
-  --loss imbalanced --loss-alpha 1.0 \
-  --loss-alpha-wrong-common 3.0 --loss-alpha-wrong-rare 10.0 \
+  --hidden-dim 256 --num-layers 3 --dropout 0.1 \
+  --loss hybrid --loss-alpha 1.0 --loss-gamma 2.0 \
   --lr 0.002 --weight-decay 1e-4 \
-  --patience 50 \
-  --epochs 200 \
+  --patience 50 --epochs 200 \
+  --balanced-sampling \
   --train-edge-sample-ratio 0.4 --sign-eps 1e-3
 
-python training.py \
+  python training.py \
   --use-attention \
-  --hidden-dim 128 --num-layers 3 --dropout 0.1 \
-  --loss hybrid --loss-alpha 0.5 --loss-gamma 1.5 \
+  --hidden-dim 256 --num-layers 3 --dropout 0.1 \
+  --loss focal --loss-gamma 2.5 \
   --lr 0.002 --weight-decay 1e-4 \
-  --patience 50 \
-  --epochs 200 \
+  --patience 50 --epochs 200 \
+  --balanced-sampling \
+  --train-edge-sample-ratio 0.4 --sign-eps 1e-3
+
+  python training.py \
+  --use-attention \
+  --hidden-dim 256 --num-layers 3 --dropout 0.1 \
+  --loss sign_corrected --loss-alpha 1.5 \
+  --lr 0.002 --weight-decay 1e-4 \
+  --patience 50 --epochs 200 \
+  --balanced-sampling \
   --train-edge-sample-ratio 0.4 --sign-eps 1e-3
   
 python feature_eng.py \
