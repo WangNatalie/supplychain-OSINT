@@ -2,6 +2,8 @@
 """
 loss_functions.py - Custom loss functions for shock propagation model
 
+Loss functions: MSE, SignCorrectedMSE, WeightedSignCorrectedMSE, FocalRegressionLoss, HybridSignFocalLoss
+
 Usage:
     from loss_functions import get_loss_function
     

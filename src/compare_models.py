@@ -137,7 +137,7 @@ def main():
     years = [int(year) for year in args.years.split(',')]
     
     print("="*80)
-    print("MULTI-YEAR MODEL COMPARISON")
+    print("MODEL COMPARISON")
     print("="*80)
     print(f"\nTesting {len(models)} models across {len(years)} years")
     print(f"Models: {', '.join(models.keys())}")
@@ -241,7 +241,7 @@ def main():
         print(f"  {metric:20s}: {best:20s} ({value:.3f})")
     
     # Save results
-    output_file = "multi_year_comparison.csv"
+    output_file = "model_comparison.csv"
     df.to_csv(output_file, index=False)
     print(f"\n✓ Detailed results saved to {output_file}")
     

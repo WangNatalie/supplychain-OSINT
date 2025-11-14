@@ -2,6 +2,8 @@
 """
 simulate_shock.py - Counterfactual Shock Analysis for Supply Chain Networks
 
+Nodes can be found in row/column labels of ICIO tables.
+
 Simulates "what-if" scenarios: What happens if Ecuador's agriculture drops 50%?
 
 Usage Examples:
@@ -9,24 +11,22 @@ Usage Examples:
     python simulate_shock.py \
         --model models/shock_propagation/best_model.pt \
         --graph embeddings/graph_2021_labeled.pt \
-        --shocked-nodes ECU_AGR \
+        --shocked-nodes ECU_A01 \
         --magnitude 0.5
 
     # Simulate multi-node shock (e.g., regional crisis)
     python simulate_shock.py \
         --model models/shock_propagation/best_model.pt \
         --graph embeddings/graph_2021_labeled.pt \
-        --shocked-nodes ECU_AGR ECU_MFG ECU_MIN \
+        --shocked-nodes ECU_A01 ECU_A02 ECU_A03 \
         --magnitude 0.3 \
-        --output ecuador_crisis_analysis.csv
 
     # Simulate cascading failure
     python simulate_shock.py \
         --model models/shock_propagation/best_model.pt \
         --graph embeddings/graph_2021_labeled.pt \
-        --shocked-nodes CHN_MFG USA_MFG DEU_MFG \
+        --shocked-nodes CHN_A01 USA_A01 DEU_A01 \
         --magnitude 0.4 \
-        --output manufacturing_crisis.csv \
         --visualize
 """
 
@@ -34,12 +34,9 @@ import torch
 import argparse
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
 from typing import List, Dict
+from pathlib import Path
 import sys
-
 
 class ShockSimulator:
     """Handles shock simulation and analysis"""
@@ -77,8 +74,17 @@ class ShockSimulator:
         print(f"✓ Shocking {len(valid_nodes)} nodes: {valid_nodes}")
         return shock_mask
     
-    def run_simulation(self, shock_mask_nodes: torch.Tensor) -> Dict[str, np.ndarray]:
-        """Run baseline and shocked predictions"""
+    def run_simulation(self, shock_mask_nodes: torch.Tensor, shock_magnitude: float = -0.20) -> Dict[str, np.ndarray]:
+        """
+        Run baseline and shocked predictions with magnitude scaling
+        
+        Args:
+            shock_mask_nodes: Binary mask indicating shocked nodes
+            shock_magnitude: Actual shock magnitude (e.g., -0.20 for 20% reduction)
+        
+        Returns:
+            Dict with baseline, shocked, and scaled propagation predictions
+        """
         with torch.no_grad():
             # Baseline prediction (business as usual)
             baseline_delta = self.model(
@@ -89,7 +95,7 @@ class ShockSimulator:
                 shock_mask_edges=None
             ).cpu().numpy()
             
-            # Shocked prediction
+            # Shocked prediction (model receives binary shock indicator)
             shocked_delta = self.model(
                 self.graph.x,
                 self.graph.edge_index,
@@ -98,10 +104,20 @@ class ShockSimulator:
                 shock_mask_edges=None
             ).cpu().numpy()
         
+        # POST-PROCESSING SCALING FIX (will remove once training is fixed)
+        # Model was trained on "typical" shocks (~17.5% average from training)
+        # Scale the predicted effect to match the desired shock magnitude
+        typical_shock_magnitude = -0.175  # Average shock magnitude from training data
+        
+        propagation_effect = shocked_delta - baseline_delta
+        scaling_factor = shock_magnitude / typical_shock_magnitude
+        scaled_propagation = propagation_effect * scaling_factor
+        
+        
         return {
             'baseline_delta': baseline_delta,
-            'shocked_delta': shocked_delta,
-            'propagation_effect': shocked_delta - baseline_delta
+            'shocked_delta': baseline_delta + scaled_propagation,  # Use scaled effect
+            'propagation_effect': scaled_propagation
         }
     
     def analyze_results(self, 
@@ -143,10 +159,10 @@ class ShockSimulator:
             'edge_type'
         ] = 'internal'
         
-        # Compute impact magnitude
-        results['abs_impact'] = np.abs(results['absolute_change'])
+        # Compute impact magnitude (by absolute dollars)
+        results['abs_change'] = np.abs(results['absolute_change'])
         
-        return results.sort_values('abs_impact', ascending=False)
+        return results.sort_values('abs_change', ascending=False)
     
     def print_summary(self, results: pd.DataFrame, shocked_nodes: List[str]):
         """Print comprehensive shock analysis summary"""
@@ -241,9 +257,33 @@ class ShockSimulator:
                 row['value_t']
             ))
         
+        # Node-level aggregation (country_sector combinations)
+        print("\n" + "-"*80)
+        print("NODE-LEVEL IMPACT (Top 10 affected country-sectors)")
+        print("-"*80)
+        
+        # Aggregate by target node
+        node_impact = results.groupby('target').agg({
+            'absolute_change': 'sum',
+            'pct_change': 'mean',
+            'value_t': 'sum'
+        }).sort_values('absolute_change', key=abs, ascending=False).head(10)
+        
+        print("\n{:<20} {:>15} {:>15} {:>15}".format(
+            "Country-Sector", "Total Impact", "Avg % Change", "Original Value"
+        ))
+        print("-"*80)
+        for node, row in node_impact.iterrows():
+            print("{:<20} ${:>14,.0f} {:>14.2f}% ${:>14,.0f}".format(
+                node[:20],
+                row['absolute_change'],
+                row['pct_change'],
+                row['value_t']
+            ))
+        
         # Top affected edges
         print("\n" + "-"*80)
-        print("TOP 15 MOST AFFECTED SUPPLY CHAINS")
+        print("TOP 15 MOST AFFECTED TRADING FLOWS")
         print("-"*80)
         
         top_edges = results.head(15)[['source', 'target', 'value_t', 
@@ -267,48 +307,6 @@ class ShockSimulator:
         print("\n" + "="*80)
 
 
-def visualize_results(results: pd.DataFrame, output_prefix: str):
-    """Create visualization plots"""
-    
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    
-    # 1. Distribution of percentage changes
-    ax = axes[0, 0]
-    results['pct_change'].hist(bins=50, ax=ax, edgecolor='black')
-    ax.set_xlabel('Percentage Change (%)')
-    ax.set_ylabel('Number of Edges')
-    ax.set_title('Distribution of Edge Value Changes')
-    ax.axvline(0, color='red', linestyle='--', alpha=0.7)
-    
-    # 2. Impact by edge type
-    ax = axes[0, 1]
-    edge_type_stats = results.groupby('edge_type')['pct_change'].agg(['mean', 'std', 'count'])
-    edge_type_stats['mean'].plot(kind='bar', ax=ax, yerr=edge_type_stats['std'], capsize=5)
-    ax.set_xlabel('Edge Type')
-    ax.set_ylabel('Mean % Change')
-    ax.set_title('Average Impact by Edge Type')
-    ax.axhline(0, color='red', linestyle='--', alpha=0.7)
-    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-    
-    # 3. Top affected countries
-    ax = axes[1, 0]
-    country_impact = results.groupby('target_country')['absolute_change'].sum().abs().sort_values(ascending=False).head(15)
-    country_impact.plot(kind='barh', ax=ax)
-    ax.set_xlabel('Total Absolute Impact')
-    ax.set_title('Top 15 Countries by Total Impact')
-    
-    # 4. Top affected sectors
-    ax = axes[1, 1]
-    sector_impact = results.groupby('target_sector')['absolute_change'].sum().abs().sort_values(ascending=False).head(15)
-    sector_impact.plot(kind='barh', ax=ax)
-    ax.set_xlabel('Total Absolute Impact')
-    ax.set_title('Top 15 Sectors by Total Impact')
-    
-    plt.tight_layout()
-    plt.savefig(f"{output_prefix}_analysis.png", dpi=300, bbox_inches='tight')
-    print(f"\n✓ Visualization saved to {output_prefix}_analysis.png")
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Simulate counterfactual shocks in supply chain networks",
@@ -324,10 +322,6 @@ def main():
                        help="Node IDs to shock (e.g., ECU_AGR CHN_MFG)")
     parser.add_argument("--magnitude", type=float, default=0.5,
                        help="Shock magnitude as fraction (0.5 = 50%% reduction)")
-    parser.add_argument("--output", default="shock_analysis.csv",
-                       help="Output CSV file for detailed results")
-    parser.add_argument("--visualize", action="store_true",
-                       help="Generate visualization plots")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--list-nodes", action="store_true",
                        help="List all available nodes in the graph and exit")
@@ -412,22 +406,13 @@ def main():
     print(f"{'='*80}")
     
     shock_mask = simulator.create_shock_mask(args.shocked_nodes)
-    predictions = simulator.run_simulation(shock_mask)
+    # Convert magnitude to negative (reduction)
+    shock_magnitude = -abs(args.magnitude)
+    predictions = simulator.run_simulation(shock_mask, shock_magnitude=shock_magnitude)
     results = simulator.analyze_results(predictions, args.shocked_nodes)
     
     # Print summary
     simulator.print_summary(results, args.shocked_nodes)
-    
-    # Save detailed results
-    output_path = Path(args.output)
-    results.to_csv(output_path, index=False)
-    print(f"\n✓ Detailed results saved to {output_path}")
-    
-    # Generate visualizations
-    if args.visualize:
-        print("\nGenerating visualizations...")
-        output_prefix = output_path.stem
-        visualize_results(results, output_prefix)
     
     # Save summary statistics
     summary = {
@@ -444,13 +429,7 @@ def main():
         'edges_affected_5pct': int((np.abs(results['pct_change']) > 5).sum()),
         'edges_affected_10pct': int((np.abs(results['pct_change']) > 10).sum()),
     }
-    
-    summary_path = output_path.parent / f"{output_path.stem}_summary.json"
-    import json
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=2)
-    print(f"✓ Summary statistics saved to {summary_path}")
-    
+        
     print(f"\n{'='*80}")
     print("SIMULATION COMPLETE")
     print(f"{'='*80}\n")

@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-feature_eng.py - Enhanced with robust data cleaning
+feature_eng.py - Build node and edge features for supply chain network
 
-Key improvements:
-1. Filter out tiny edges (< $1M) that are mostly noise
-2. Cap extreme outliers (likely data errors)
-3. More informative logging of data quality
+Current usage:
+python feature_eng.py \
+  --start-year 2021 --end-year 2022 \
+  --min-edge-value 1.0 \
+  --max-log-change 3.0 \
+  --min-pct-change 0.01
 """
 
-from load_icio import read_icio
+from cosmosdb.load_icio import read_icio
 import torch
 import pandas as pd
 import numpy as np

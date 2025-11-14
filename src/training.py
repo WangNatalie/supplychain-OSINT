@@ -15,6 +15,16 @@ TRAINING DATA GENERATION:
 - Each year-to-year transition is a "natural experiment"
 - Edges that dropped significantly = natural shocks
 - Learn how network structure + shock indicators → edge value changes
+
+Current usage:
+python training.py \
+  --use-attention \
+  --hidden-dim 128 --num-layers 3 --dropout 0.1 \
+  --loss hybrid --loss-alpha 1.0 --loss-gamma 2.0 \
+  --lr 0.002 --weight-decay 1e-4 \
+  --patience 50 --epochs 200 \
+  --balanced-sampling --save-dir "models/hybrid" \
+  --train-edge-sample-ratio 0.4 --sign-eps 1e-3
 """
 
 import torch
@@ -32,10 +42,11 @@ from typing import List, Dict, Tuple, Optional
 import warnings
 import psutil
 import os
-warnings.filterwarnings('ignore')
 from loss_functions import get_loss_function
 from tqdm import tqdm
 import time
+
+warnings.filterwarnings('ignore')
 
 # Epsilon for sign comparisons; overridden by --sign-eps
 SIGN_EPS = 1e-4
@@ -327,7 +338,7 @@ def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0
     shock_mask_edges = example_metadata.get('shock_mask_edges')
     shock_mask_nodes = example_metadata.get('shock_mask_nodes')
     if shock_mask_edges is None or shock_mask_nodes is None:
-        # Fallback to on-the-fly computation (shouldn't happen once precomputed)
+        # Fallback to on-the-fly computation
         pct_change = (value_t1 - value_t) / (value_t + 1e-8)
         shock_mask_edges = (pct_change < -example_metadata['shock_threshold']).float()
         src_idx, _ = graph.edge_index
@@ -351,7 +362,6 @@ def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0
         else:
             sampled_edge_idx = balanced_idx.long()
     else:
-        # Original stratified sampling: keep all shocked edges + random sample of others
         num_edges = graph.edge_index.shape[1]
         num_sampled = int(num_edges * edge_sample_ratio)
         
@@ -839,9 +849,8 @@ def main():
     
     # Create training data with shock annotations
     if args.balanced_sampling:
-        print("\nCreating balanced training data...")
-    else:
-        print("\nAnnotating natural shocks in historical data...")
+        print("\nCreating training data with stratified sampling...")
+
     train_data = create_shock_training_data(
         train_years, args.embeddings_dir, args.shock_threshold,
         balanced_sampling=args.balanced_sampling,
