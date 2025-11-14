@@ -1,4 +1,16 @@
-from load_icio import read_icio
+#!/usr/bin/env python3
+"""
+feature_eng.py - Build node and edge features for supply chain network
+
+Current usage:
+python feature_eng.py \
+  --start-year 2021 --end-year 2022 \
+  --min-edge-value 1.0 \
+  --max-log-change 3.0 \
+  --min-pct-change 0.01
+"""
+
+from cosmosdb.load_icio import read_icio
 import torch
 import pandas as pd
 import numpy as np
@@ -127,7 +139,6 @@ def label_trade_drops(edges_t: pd.DataFrame,
         - y_disappear: 1 if established edge goes to zero, 0 otherwise
         - is_new_edge: True if edge didn't exist at t-1
         - is_established: True if edge existed at both t-1 and t
-        - existed_prev: True if edge existed at t-1 (regardless of t)
     """
     # Get all edges that should be tracked at time t
     if edges_prev is not None:
@@ -187,10 +198,7 @@ def label_trade_drops(edges_t: pd.DataFrame,
         )
     
     # === LABELS: Only for established edges that exist at t ===
-    # New edges cannot be labeled for drops (no baseline)
-    # Disappeared edges (existed prev, zero at t) are excluded from active predictions
-    
-    active_edges = merged['exists_now']  # Only edges that exist at t can be predicted
+    active_edges = merged['exists_now']
     
     merged['y_drop'] = 0
     merged['y_disappear'] = 0
@@ -208,13 +216,63 @@ def label_trade_drops(edges_t: pd.DataFrame,
     
     return merged
 
-def icio_to_edges(df: pd.DataFrame, sector_cols: list) -> pd.DataFrame:
-    """Convert ICIO table to edge list."""
+def icio_to_edges(df: pd.DataFrame, sector_cols: list, 
+                 min_value: float = 0.0) -> pd.DataFrame:
+    """
+    Convert ICIO table to edge list with optional quality filtering.
+    
+    Args:
+        df: ICIO matrix
+        sector_cols: Column names to include
+        min_value: Minimum edge value to keep (default 0.0 = no filtering)
+    
+    Returns:
+        Filtered edge DataFrame
+    """
     df = df.loc[sector_cols, sector_cols]
     edges = df.stack().reset_index()
     edges.columns = ['source', 'target', 'value']
-    edges = edges[edges["value"] > 0].dropna(subset=["value"])
+    
+    # Filter: positive values above threshold
+    if min_value > 0:
+        edges = edges[edges["value"] >= min_value].dropna(subset=["value"])
+    else:
+        edges = edges[edges["value"] > 0].dropna(subset=["value"])
+    
     return edges
+
+def clean_edge_values(value_t: np.ndarray, value_t1: np.ndarray, 
+                     max_log_change: float = 3.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Clean edge values and cap extreme changes.
+    
+    Args:
+        value_t: Current edge values
+        value_t1: Next year edge values  
+        max_log_change: Maximum absolute log change to allow (default 3.0 = ~20x change)
+    
+    Returns:
+        cleaned_value_t, cleaned_value_t1, valid_mask
+    """
+    # Compute log changes
+    log_t = np.log1p(value_t)
+    log_t1 = np.log1p(value_t1)
+    delta_log = log_t1 - log_t
+    
+    # Identify outliers
+    outlier_mask = np.abs(delta_log) > max_log_change
+    
+    if outlier_mask.any():
+        print(f"  ⚠️  Capping {outlier_mask.sum()} edges with extreme changes (|Δlog| > {max_log_change})")
+        
+        # Cap at max_log_change while preserving sign
+        delta_log_capped = np.clip(delta_log, -max_log_change, max_log_change)
+        log_t1_capped = log_t + delta_log_capped
+        value_t1_capped = np.expm1(log_t1_capped)
+        
+        return value_t, value_t1_capped, ~outlier_mask
+    
+    return value_t, value_t1, np.ones(len(value_t), dtype=bool)
 
 def standardize_df_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     """Standardize specified columns in-place for memory efficiency."""
@@ -240,15 +298,26 @@ def build_graph(
     edges_prev: Optional[pd.DataFrame] = None,
     external_data: Optional[pd.DataFrame] = None,
     year: Optional[int] = None,
-    start_year: Optional[int] = None
+    start_year: Optional[int] = None,
+    min_edge_value: float = 0.0,  # Default disabled: keep all positive edges
+    max_log_change: float = 0.0,  # Default disabled: 0 = no capping
+    min_pct_change: float = 0.0  # Default disabled: 0 = no filtering by % change
 ) -> Tuple[Data, pd.DataFrame, pd.Index]:
     """
-    Build graph with 1-year temporal features.
-    Memory optimized for 16GB RAM.
+    Build graph with robust data cleaning.
+    
+    Cleaning parameters (all disabled by default):
+        min_edge_value: Minimum edge value in millions USD (>0 enables filter)
+        max_log_change: Cap |Δlog| to this value (>0 enables capping)
+        min_pct_change: Keep edges with |%change| ≥ this (>0 enables filter)
     """
-    # 1) Build edges
-    edges_t = icio_to_edges(df_t, sector_cols)
-    edges_t1 = icio_to_edges(df_t1, sector_cols)
+    print(f"\n📊 Building graph for year {year}")
+    
+    # 1) Build edges with filtering
+    edges_t = icio_to_edges(df_t, sector_cols, min_value=min_edge_value)
+    edges_t1 = icio_to_edges(df_t1, sector_cols, min_value=min_edge_value)
+    
+    print(f"  Edges after value filter (≥${min_edge_value}M): {len(edges_t)}")
     
     # 2) Node features with 1-year lag
     node_feats_t = build_node_features(edges_t, edges_prev, external_data)
@@ -266,7 +335,24 @@ def build_graph(
         how="left"
     )
     
-    # 6) Node indexing
+    # 6) Clean extreme values (only if enabled)
+    if max_log_change and max_log_change > 0.0:
+        value_t_clean, value_t1_clean, valid_mask = clean_edge_values(
+            merged['value_t'].values,
+            merged['value_t1'].values,
+            max_log_change=max_log_change
+        )
+        merged['value_t1'] = value_t1_clean
+        merged = merged[valid_mask].copy()
+    
+    # 7) Filter near-zero changes (only if enabled)
+    if min_pct_change and min_pct_change > 0.0:
+        abs_pct_change = np.abs(merged['pct_change'].fillna(0))
+        significant_mask = abs_pct_change >= min_pct_change
+        print(f"  Edges with significant changes (|Δ%| ≥ {min_pct_change:.1%}): {significant_mask.sum()}")
+        merged = merged[significant_mask].copy()
+    
+    # 8) Node indexing
     if global_node_index is None:
         nodes = pd.Index(sorted(set(merged["source"]) | set(merged["target"])))
     else:
@@ -275,17 +361,17 @@ def build_graph(
     
     merged = merged[merged["source"].isin(nodes) & merged["target"].isin(nodes)].copy()
     
-    # 7) Identify feature columns dynamically
+    # 9) Identify feature columns dynamically
     exclude_cols = {'source', 'target', 'value_t', 'value_t1', 'pct_change', 
                    'y_drop', 'src_id', 'tgt_id', 'value'}
     edge_feat_cols = [c for c in merged.columns if c not in exclude_cols]
     edge_feat_cols = [c for c in edge_feat_cols if merged[c].dtype in 
                      ['float64', 'float32', 'int64', 'int32']]
     
-    # 8) Standardize
+    # 10) Standardize
     merged_std = standardize_df_columns(merged, edge_feat_cols)
     
-    # 9) Build edge tensors
+    # 11) Build edge tensors
     merged_std["src_id"] = merged_std["source"].map(node_id_map)
     merged_std["tgt_id"] = merged_std["target"].map(node_id_map)
     
@@ -302,7 +388,7 @@ def build_graph(
         dtype=torch.float32
     )
     
-    # 10) Build node feature matrix
+    # 12) Build node feature matrix
     node_feats_aligned = node_feats_t.reindex(nodes).fillna(0.0)
     node_feat_cols = list(node_feats_aligned.columns)
     node_feats_aligned_std = standardize_df_columns(node_feats_aligned, node_feat_cols)
@@ -311,13 +397,13 @@ def build_graph(
         dtype=torch.float32
     )
     
-    # 11) Optional: Add year encoding (cheap feature)
+    # 13) Optional: Add year encoding
     if year is not None:
         year_normalized = (year - start_year) / 20.0
         time_feat = torch.full((x.shape[0], 1), year_normalized, dtype=torch.float32)
         x = torch.cat([x, time_feat], dim=1)
     
-    # 12) Assemble graph
+    # 14) Assemble graph
     value_t = torch.tensor(
         merged_std["value_t"].values, 
         dtype=torch.float32
@@ -326,6 +412,15 @@ def build_graph(
         merged_std["value_t1"].values, 
         dtype=torch.float32
     )
+    
+    # Compute cleaned delta_log for verification
+    delta_log = torch.log1p(value_t1) - torch.log1p(value_t)
+    
+    print(f"  📈 Final edge statistics:")
+    print(f"    Total edges: {len(merged_std)}")
+    print(f"    Positive labels (drops): {edge_y.sum().item()} ({100*edge_y.mean():.1f}%)")
+    print(f"    Δlog range: [{delta_log.min():.2f}, {delta_log.max():.2f}]")
+    print(f"    Δlog std: {delta_log.std():.3f}")
     
     graph = Data(
         x=x,
@@ -344,37 +439,59 @@ def build_graph(
  
 def main():
     """
-    Memory-efficient pipeline for 16GB RAM.
-    Only keeps previous year's edges in memory.
+    Memory-efficient pipeline with robust data cleaning.
     Usage: python feature_eng.py --start-year [start year] --end-year [end year]
     """
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--start-year", type=int, default=1996)
     ap.add_argument("--end-year", type=int, default=2022)
+    
+    # NEW: Data quality parameters
+    ap.add_argument("--min-edge-value", type=float, default=0.0,
+                   help="Minimum edge value in millions USD (>0 enables filter; default 0 = off)")
+    ap.add_argument("--max-log-change", type=float, default=0.0,
+                   help="Cap |Δlog| to this value (>0 enables capping; default 0 = off)")
+    ap.add_argument("--min-pct-change", type=float, default=0.0,
+                   help="Keep edges with |%%change| ≥ this (>0 enables filter; default 0 = off)")
+    
     args = ap.parse_args()
 
+    print("\n" + "="*70)
+    print("ENHANCED FEATURE ENGINEERING WITH DATA CLEANING")
+    print("="*70)
+    min_edge_msg = f"${args.min_edge_value}M" if args.min_edge_value > 0 else "off"
+    max_log_msg = (
+        f"±{args.max_log_change} (~{np.expm1(args.max_log_change):.0f}x)"
+        if args.max_log_change > 0 else "off"
+    )
+    min_pct_msg = f"{args.min_pct_change:.1%}" if args.min_pct_change > 0 else "off"
+    print(f"Min edge value: {min_edge_msg}")
+    print(f"Max log change: {max_log_msg}")
+    print(f"Min % change: {min_pct_msg}")
+    print("="*70)
+
     # Fixed node index from first year
-    print("Reading first year ICIO table to establish node index...")
+    print("\nReading first year ICIO table to establish node index...")
     df_first, cols = read_icio(f"ICIO/{args.start_year}_SML.csv")
     nodes_global = pd.Index(sorted(cols))
     
-    edges_prev = None  # No lag for first year
+    edges_prev = None
     df_t = None
     cols_t = None
 
-    # Load previous year if it exists (for lag features)
+    # Load previous year if it exists
     prev_year = args.start_year - 1
     prev_file = f"ICIO/{prev_year}_SML.csv"
     if os.path.exists(prev_file):
         print(f"Loading {prev_year} for lag features...")
         df_prev, cols_prev = read_icio(prev_file)
-        edges_prev = icio_to_edges(df_prev, cols_prev)
+        edges_prev = icio_to_edges(df_prev, cols_prev, min_value=args.min_edge_value)
         print(f"  Lag features will be available starting from {args.start_year}")
     else:
         print(f"No {prev_year} data found - first year will have no lag features")
     
-    # Process all years in single loop
+    # Process all years
     for year in range(args.start_year, args.end_year):
         # Load current year if not already loaded
         if df_t is None:
@@ -385,9 +502,7 @@ def main():
         print(f"Reading {year+1} ICIO table...")
         df_t1, cols_t1 = read_icio(f"ICIO/{year+1}_SML.csv")
         
-        # Generate graph
-        lag_status = "with lag features" if edges_prev is not None else "(no lag - first year)"
-        print(f"Generating {year} graph {lag_status}...")
+        # Generate graph with cleaning
         external_data = load_indicators(year, nodes_global)
         graph, edges_df, _ = build_graph(
             df_t, df_t1, cols_t,
@@ -396,22 +511,27 @@ def main():
             edges_prev=edges_prev,
             external_data=external_data,
             year=year,
-            start_year=args.start_year
+            start_year=args.start_year,
+            min_edge_value=args.min_edge_value,
+            max_log_change=args.max_log_change,
+            min_pct_change=args.min_pct_change
         )
         
         torch.save(graph, f"embeddings/graph_{year}_labeled.pt")
-        print(f"Saved {year} graph. Nodes: {graph.num_nodes}, Edges: {graph.edge_index.shape[1]}")
+        print(f"✅ Saved {year} graph")
+        print(f"  Nodes: {graph.num_nodes}, Edges: {graph.edge_index.shape[1]}")
         print(f"  Node features: {graph.x.shape[1]}, Edge features: {graph.edge_attr.shape[1]}")
-        print(f"  Positive class: {graph.y.sum().item()}/{len(graph.y)} ({100*graph.y.mean():.2f}%)")
         
-        # Update for next iteration (memory efficient)
-        edges_prev = icio_to_edges(df_t, cols_t)
+        # Update for next iteration
+        edges_prev = icio_to_edges(df_t, cols_t, min_value=args.min_edge_value)
         df_t = df_t1
         cols_t = cols_t1
     
-    print("\n✓ Pipeline complete!")
-    print(f"Generated graphs for years {args.start_year}-{args.end_year-1}")
+    print("\n" + "="*70)
+    print("✅ Pipeline complete!")
+    print(f"Generated graphs for years {args.start_year}-{args.end_year}")
     print(f"Saved to embeddings/ directory")
+    print("="*70 + "\n")
 
 if __name__ == "__main__":
     main()

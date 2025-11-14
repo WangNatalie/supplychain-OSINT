@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+world_data.py - Load World Bank data for external indicators
+
+Load World Bank data for external indicators. Uses regional/world averages to fill missing data.
+"""
 import pandas as pd
 import numpy as np
 import wbgapi as wb
