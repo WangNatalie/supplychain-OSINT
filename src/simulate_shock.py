@@ -38,6 +38,13 @@ from typing import List, Dict
 from pathlib import Path
 import sys
 
+# Import ICIO parser functions for plain English formatting
+from ICIO.ICIO_parser import (
+    format_node_name,
+    format_sector_name,
+    format_country_name
+)
+
 class ShockSimulator:
     """Handles shock simulation and analysis"""
     
@@ -71,7 +78,11 @@ class ShockSimulator:
         if len(valid_nodes) == 0:
             raise ValueError("No valid nodes found to shock!")
         
-        print(f"✓ Shocking {len(valid_nodes)} nodes: {valid_nodes}")
+        # Print in plain English
+        print(f"✓ Shocking {len(valid_nodes)} node(s):")
+        for node in valid_nodes:
+            print(f"  • {format_node_name(node, include_code=True)}")
+        
         return shock_mask
     
     def run_simulation(self, shock_mask_nodes: torch.Tensor, shock_magnitude: float = -0.20) -> Dict[str, np.ndarray]:
@@ -123,7 +134,7 @@ class ShockSimulator:
     def analyze_results(self, 
                        predictions: Dict[str, np.ndarray],
                        shocked_nodes: List[str]) -> pd.DataFrame:
-        """Convert predictions to interpretable DataFrame"""
+        """Convert predictions to interpretable DataFrame (codes only, format on display)"""
         
         # Extract edge information
         src_idx, tgt_idx = self.graph.edge_index.cpu().numpy()
@@ -134,14 +145,26 @@ class ShockSimulator:
         baseline_value_t1 = np.expm1(log_value_t + predictions['baseline_delta'])
         shocked_value_t1 = np.expm1(log_value_t + predictions['shocked_delta'])
         
-        # Build results DataFrame
+        # Extract codes only (no expensive string formatting yet)
+        source_codes = [self.graph.node_labels[i] for i in src_idx]
+        target_codes = [self.graph.node_labels[i] for i in tgt_idx]
+        
+        source_countries = [node.split('_')[0] if '_' in node else node for node in source_codes]
+        target_countries = [node.split('_')[0] if '_' in node else node for node in target_codes]
+        source_sectors = [node.split('_')[1] if '_' in node else 'UNK' for node in source_codes]
+        target_sectors = [node.split('_')[1] if '_' in node else 'UNK' for node in target_codes]
+        
+        # Build results DataFrame with codes only
         results = pd.DataFrame({
-            'source': [self.graph.node_labels[i] for i in src_idx],
-            'target': [self.graph.node_labels[i] for i in tgt_idx],
-            'source_country': [self.graph.node_labels[i].split('_')[0] for i in src_idx],
-            'target_country': [self.graph.node_labels[i].split('_')[0] for i in tgt_idx],
-            'source_sector': [self.graph.node_labels[i].split('_')[1] if '_' in self.graph.node_labels[i] else 'UNK' for i in src_idx],
-            'target_sector': [self.graph.node_labels[i].split('_')[1] if '_' in self.graph.node_labels[i] else 'UNK' for i in tgt_idx],
+            # Codes (we'll format to plain English only when displaying)
+            'source': source_codes,
+            'target': target_codes,
+            'source_country': source_countries,
+            'target_country': target_countries,
+            'source_sector': source_sectors,
+            'target_sector': target_sectors,
+            
+            # Values
             'value_t': value_t,
             'baseline_value_t1': baseline_value_t1,
             'shocked_value_t1': shocked_value_t1,
@@ -171,8 +194,12 @@ class ShockSimulator:
         print("SHOCK PROPAGATION ANALYSIS")
         print("="*80)
         
-        print(f"\nShocked Nodes: {shocked_nodes}")
-        print(f"Total Edges Analyzed: {len(results):,}")
+        # Format shocked nodes in plain English
+        shocked_names = [format_node_name(node, include_code=True) for node in shocked_nodes]
+        print(f"\nShocked Nodes:")
+        for name in shocked_names:
+            print(f"  • {name}")
+        print(f"\nTotal Edges Analyzed: {len(results):,}")
         
         # Breakdown by edge type
         print("\n" + "-"*80)
@@ -222,13 +249,14 @@ class ShockSimulator:
             'value_t': 'sum'
         }).sort_values('absolute_change', key=abs, ascending=False).head(10)
         
-        print("\n{:<15} {:>15} {:>15} {:>15}".format(
+        print("\n{:<30} {:>15} {:>12} {:>15}".format(
             "Country", "Total Impact", "Avg % Change", "Original Value"
         ))
         print("-"*80)
-        for country, row in country_impact.iterrows():
-            print("{:<15} ${:>14,.0f} {:>14.2f}% ${:>14,.0f}".format(
-                country,
+        for country_code, row in country_impact.iterrows():
+            country_name = format_country_name(country_code)
+            print("{:<30} ${:>14,.0f} {:>11.2f}% ${:>14,.0f}".format(
+                country_name[:28],
                 row['absolute_change'],
                 row['pct_change'],
                 row['value_t']
@@ -245,16 +273,17 @@ class ShockSimulator:
             'value_t': 'sum'
         }).sort_values('absolute_change', key=abs, ascending=False).head(10)
         
-        print("\n{:<15} {:>15} {:>15} {:>15}".format(
-            "Sector", "Total Impact", "Avg % Change", "Original Value"
+        print("\n{:<50} {:>15} {:>12}".format(
+            "Sector", "Total Impact", "Avg % Change"
         ))
         print("-"*80)
-        for sector, row in sector_impact.iterrows():
-            print("{:<15} ${:>14,.0f} {:>14.2f}% ${:>14,.0f}".format(
-                sector,
+        for sector_code, row in sector_impact.iterrows():
+            sector_name = format_sector_name(sector_code)
+            display_name = sector_name[:48] if len(sector_name) > 48 else sector_name
+            print("{:<50} ${:>14,.0f} {:>11.2f}%".format(
+                display_name,
                 row['absolute_change'],
-                row['pct_change'],
-                row['value_t']
+                row['pct_change']
             ))
         
         # Node-level aggregation (country_sector combinations)
@@ -262,23 +291,23 @@ class ShockSimulator:
         print("NODE-LEVEL IMPACT (Top 10 affected country-sectors)")
         print("-"*80)
         
-        # Aggregate by target node
         node_impact = results.groupby('target').agg({
             'absolute_change': 'sum',
             'pct_change': 'mean',
             'value_t': 'sum'
         }).sort_values('absolute_change', key=abs, ascending=False).head(10)
         
-        print("\n{:<20} {:>15} {:>15} {:>15}".format(
-            "Country-Sector", "Total Impact", "Avg % Change", "Original Value"
+        print("\n{:<50} {:>15} {:>12}".format(
+            "Country-Sector", "Total Impact", "Avg % Change"
         ))
         print("-"*80)
-        for node, row in node_impact.iterrows():
-            print("{:<20} ${:>14,.0f} {:>14.2f}% ${:>14,.0f}".format(
-                node[:20],
+        for node_code, row in node_impact.iterrows():
+            node_name = format_node_name(node_code)
+            display_name = node_name[:48] if len(node_name) > 48 else node_name
+            print("{:<50} ${:>14,.0f} {:>11.2f}%".format(
+                display_name,
                 row['absolute_change'],
-                row['pct_change'],
-                row['value_t']
+                row['pct_change']
             ))
         
         # Top affected edges
@@ -286,20 +315,24 @@ class ShockSimulator:
         print("TOP 15 MOST AFFECTED TRADING FLOWS")
         print("-"*80)
         
-        top_edges = results.head(15)[['source', 'target', 'value_t', 
-                                      'baseline_value_t1', 'shocked_value_t1',
-                                      'absolute_change', 'pct_change', 'edge_type']]
+        top_edges = results.head(15)
         
-        print("\n{:<15} {:<15} {:>12} {:>12} {:>12} {:>10}".format(
-            "Source", "Target", "Current", "Shocked", "Change", "% Change"
+        print("\n{:<40} {:<40} {:>15} {:>10}".format(
+            "Source", "Target", "$ Change", "% Change"
         ))
         print("-"*80)
         for _, row in top_edges.iterrows():
-            print("{:<15} {:<15} ${:>11,.0f} ${:>11,.0f} ${:>11,.0f} {:>9.2f}%".format(
-                row['source'][:15],
-                row['target'][:15],
-                row['value_t'],
-                row['shocked_value_t1'],
+            # Format codes to plain English only for display
+            source_name = format_node_name(row['source'])
+            target_name = format_node_name(row['target'])
+            
+            # Truncate long names for display
+            source_display = source_name[:38] if len(source_name) > 38 else source_name
+            target_display = target_name[:38] if len(target_name) > 38 else target_name
+            
+            print("{:<40} {:<40} ${:>14,.0f} {:>9.2f}%".format(
+                source_display,
+                target_display,
                 row['absolute_change'],
                 row['pct_change']
             ))
@@ -325,6 +358,8 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--list-nodes", action="store_true",
                        help="List all available nodes in the graph and exit")
+    parser.add_argument("--output", type=str,
+                       help="Path to save detailed results CSV (optional)")
     
     args = parser.parse_args()
     
@@ -341,21 +376,30 @@ def main():
         nodes_by_country = {}
         for node in graph.node_labels:
             if '_' in node:
-                country = node.split('_')[0]
-                sector = node.split('_')[1]
+                country_code = node.split('_')[0]
+                sector_code = node.split('_')[1]
             else:
-                country = node
-                sector = 'N/A'
+                country_code = node
+                sector_code = 'N/A'
             
-            if country not in nodes_by_country:
-                nodes_by_country[country] = []
-            nodes_by_country[country].append((node, sector))
+            if country_code not in nodes_by_country:
+                nodes_by_country[country_code] = []
+            nodes_by_country[country_code].append((node, sector_code))
         
-        for country in sorted(nodes_by_country.keys()):
-            nodes = nodes_by_country[country]
-            print(f"\n{country} ({len(nodes)} sectors):")
-            for node, sector in sorted(nodes):
-                print(f"  {node}")
+        for country_code in sorted(nodes_by_country.keys()):
+            nodes = nodes_by_country[country_code]
+            country_name = format_country_name(country_code)
+            
+            print(f"\n{country_name} [{country_code}] ({len(nodes)} sectors):")
+            print("-" * 80)
+            
+            for node, sector_code in sorted(nodes):
+                if sector_code != 'N/A':
+                    # Show: plain English name (and code for reference)
+                    node_name = format_node_name(node)
+                    print(f"  {node:<15} → {node_name}")
+                else:
+                    print(f"  {node:<15}")
         
         return
     
@@ -413,6 +457,15 @@ def main():
     
     # Print summary
     simulator.print_summary(results, args.shocked_nodes)
+    
+    # Save detailed results to CSV if requested
+    if args.output:
+        # For CSV, keep codes only (processing 669K rows to plain English is slow)
+        # Users can filter by codes and format specific rows if needed
+        results.to_csv(args.output, index=False)
+        print(f"\n✓ Detailed results saved to: {args.output}")
+        print(f"  Contains {len(results):,} edges (codes saved, use ICIO_parser.py to convert to plain English)")
+        print(f"  Tip: Filter CSV first, then convert top results to plain English")
     
     # Save summary statistics
     summary = {

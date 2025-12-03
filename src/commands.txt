@@ -21,8 +21,7 @@ python simulate_shock.py \
   --graph embeddings/graph_2021_labeled.pt \
   --shocked-nodes USA_A01 \
   --magnitude 0.20 \
-  --output shock_analysis.csv \
-  --visualize
+  --output shock_analysis.csv
 
 # Compare multiple shock scenarios
 python simulate_shock.py --model models/hybrid/best_model.pt \
@@ -31,4 +30,4 @@ python simulate_shock.py --model models/hybrid/best_model.pt \
 
 # List available nodes to shock
 python simulate_shock.py --model models/hybrid/best_model.pt \
-  --graph embeddings/graph_2021_labeled.pt --list-nodes
+  --graph embeddings/graph_2021_labeled.pt --shocked-nodes USA_A01 --list-nodes
