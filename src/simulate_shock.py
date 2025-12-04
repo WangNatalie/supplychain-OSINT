@@ -19,15 +19,22 @@ Usage Examples:
         --model models/shock_propagation/best_model.pt \
         --graph embeddings/graph_2021_labeled.pt \
         --shocked-nodes ECU_A01 ECU_A02 ECU_A03 \
-        --magnitude 0.3 \
+        --magnitude 0.3
 
-    # Simulate cascading failure
+    # Simulate edge shock (test direct edge response)
     python simulate_shock.py \
         --model models/shock_propagation/best_model.pt \
         --graph embeddings/graph_2021_labeled.pt \
-        --shocked-nodes CHN_A01 USA_A01 DEU_A01 \
-        --magnitude 0.4 \
-        --visualize
+        --shocked-edges USA_C26->CHN_C26 \
+        --magnitude 0.2
+
+    # Simulate combined node + edge shock
+    python simulate_shock.py \
+        --model models/shock_propagation/best_model.pt \
+        --graph embeddings/graph_2021_labeled.pt \
+        --shocked-nodes CHN_A01 \
+        --shocked-edges USA_C26->CHN_C26 DEU_C26->USA_C26 \
+        --magnitude 0.4
 """
 
 import torch
@@ -60,8 +67,17 @@ class ShockSimulator:
                 "Please re-run feature_eng.py with updated build_graph_with_labels()."
             )
     
-    def create_shock_mask(self, shocked_nodes: List[str]) -> torch.Tensor:
-        """Create binary shock mask for specified nodes"""
+    def create_shock_mask(self, shocked_nodes: List[str], shock_magnitude: float) -> torch.Tensor:
+        """
+        Create magnitude-based shock mask for specified nodes.
+        
+        Args:
+            shocked_nodes: List of node IDs to shock (e.g., ['USA_A01'])
+            shock_magnitude: Actual shock magnitude (e.g., -0.20 for 20% reduction)
+        
+        Returns:
+            Shock mask tensor with magnitude values (not binary)
+        """
         shock_mask = torch.zeros(self.graph.num_nodes, device=self.device)
         valid_nodes = []
         
@@ -72,29 +88,87 @@ class ShockSimulator:
                 continue
             
             idx = self.graph.node_id_to_idx[node_id]
-            shock_mask[idx] = 1.0
+            shock_mask[idx] = shock_magnitude  # Actual magnitude, not binary 1
             valid_nodes.append(node_id)
         
         if len(valid_nodes) == 0:
             raise ValueError("No valid nodes found to shock!")
         
         # Print in plain English
-        print(f"✓ Shocking {len(valid_nodes)} node(s):")
+        print(f"✓ Shocking {len(valid_nodes)} node(s) with {abs(shock_magnitude):.0%} reduction:")
         for node in valid_nodes:
             print(f"  • {format_node_name(node, include_code=True)}")
         
         return shock_mask
     
-    def run_simulation(self, shock_mask_nodes: torch.Tensor, shock_magnitude: float = -0.20) -> Dict[str, np.ndarray]:
+    def create_edge_shock_mask(self, shocked_edges: List[str], shock_magnitude: float) -> torch.Tensor:
         """
-        Run baseline and shocked predictions with magnitude scaling
+        Create magnitude-based shock mask for specified edges.
         
         Args:
-            shock_mask_nodes: Binary mask indicating shocked nodes
+            shocked_edges: List of edge specifications (e.g., ['USA_A01->CHN_A01', 'DEU_C26->USA_C26'])
             shock_magnitude: Actual shock magnitude (e.g., -0.20 for 20% reduction)
         
         Returns:
-            Dict with baseline, shocked, and scaled propagation predictions
+            Shock mask tensor with magnitude values (not binary)
+        """
+        shock_mask = torch.zeros(self.graph.edge_index.shape[1], device=self.device)
+        valid_edges = []
+        
+        # Build edge lookup for efficient matching
+        src_idx, tgt_idx = self.graph.edge_index.cpu().numpy()
+        edge_to_idx = {}
+        for i in range(len(src_idx)):
+            src_node = self.graph.node_labels[src_idx[i]]
+            tgt_node = self.graph.node_labels[tgt_idx[i]]
+            edge_key = f"{src_node}->{tgt_node}"
+            edge_to_idx[edge_key] = i
+        
+        for edge_spec in shocked_edges:
+            if '->' not in edge_spec:
+                print(f"Warning: Invalid edge format '{edge_spec}'. Use format 'SOURCE->TARGET'")
+                continue
+            
+            if edge_spec not in edge_to_idx:
+                print(f"Warning: Edge '{edge_spec}' not found in graph")
+                # Show similar edges for debugging
+                src_node = edge_spec.split('->')[0]
+                similar = [k for k in list(edge_to_idx.keys())[:10] if k.startswith(src_node)]
+                if similar:
+                    print(f"  Similar edges: {similar[:3]}")
+                continue
+            
+            idx = edge_to_idx[edge_spec]
+            shock_mask[idx] = shock_magnitude
+            valid_edges.append(edge_spec)
+        
+        if len(valid_edges) == 0:
+            raise ValueError("No valid edges found to shock!")
+        
+        # Print in plain English
+        print(f"✓ Shocking {len(valid_edges)} edge(s) with {abs(shock_magnitude):.0%} reduction:")
+        for edge_spec in valid_edges:
+            src, tgt = edge_spec.split('->')
+            src_name = format_node_name(src)
+            tgt_name = format_node_name(tgt)
+            print(f"  • {src_name} → {tgt_name}")
+        
+        return shock_mask
+    
+    def run_simulation(self, shock_mask_nodes: torch.Tensor = None, 
+                      shock_mask_edges: torch.Tensor = None) -> Dict[str, np.ndarray]:
+        """
+        Run baseline and shocked predictions.
+        
+        Args:
+            shock_mask_nodes: Magnitude-based shock mask for nodes (e.g., -0.20 for shocked nodes)
+            shock_mask_edges: Magnitude-based shock mask for edges (e.g., -0.20 for shocked edges)
+        
+        Returns:
+            Dict with baseline, shocked, and propagation effect predictions
+        
+        Note: Shock masks already contain the actual magnitude, so model
+              receives the correct signal directly (no post-processing needed)
         """
         with torch.no_grad():
             # Baseline prediction (business as usual)
@@ -106,35 +180,34 @@ class ShockSimulator:
                 shock_mask_edges=None
             ).cpu().numpy()
             
-            # Shocked prediction (model receives binary shock indicator)
+            # Shocked prediction (model now receives actual magnitude values)
             shocked_delta = self.model(
                 self.graph.x,
                 self.graph.edge_index,
                 self.graph.edge_attr,
-                shock_mask_nodes=shock_mask_nodes,
-                shock_mask_edges=None
+                shock_mask_nodes=shock_mask_nodes,  # Contains actual magnitude
+                shock_mask_edges=shock_mask_edges   # Contains actual magnitude
             ).cpu().numpy()
         
-        # POST-PROCESSING SCALING FIX (will remove once training is fixed)
-        # Model was trained on "typical" shocks (~17.5% average from training)
-        # Scale the predicted effect to match the desired shock magnitude
-        typical_shock_magnitude = -0.175  # Average shock magnitude from training data
-        
+        # No post-processing needed! Model learned magnitude relationships during training
         propagation_effect = shocked_delta - baseline_delta
-        scaling_factor = shock_magnitude / typical_shock_magnitude
-        scaled_propagation = propagation_effect * scaling_factor
-        
         
         return {
             'baseline_delta': baseline_delta,
-            'shocked_delta': baseline_delta + scaled_propagation,  # Use scaled effect
-            'propagation_effect': scaled_propagation
+            'shocked_delta': shocked_delta,
+            'propagation_effect': propagation_effect
         }
     
     def analyze_results(self, 
                        predictions: Dict[str, np.ndarray],
-                       shocked_nodes: List[str]) -> pd.DataFrame:
+                       shocked_nodes: List[str] = None,
+                       shocked_edges: List[str] = None) -> pd.DataFrame:
         """Convert predictions to interpretable DataFrame (codes only, format on display)"""
+        
+        if shocked_nodes is None:
+            shocked_nodes = []
+        if shocked_edges is None:
+            shocked_edges = []
         
         # Extract edge information
         src_idx, tgt_idx = self.graph.edge_index.cpu().numpy()
@@ -173,39 +246,86 @@ class ShockSimulator:
             'propagation_effect_log': predictions['propagation_effect']
         })
         
+        # Create edge keys for matching
+        results['edge_key'] = results['source'] + '->' + results['target']
+        
         # Categorize edge relationships to shock
         results['edge_type'] = 'indirect'
-        results.loc[results['source'].isin(shocked_nodes), 'edge_type'] = 'direct_outgoing'
-        results.loc[results['target'].isin(shocked_nodes), 'edge_type'] = 'direct_incoming'
-        results.loc[
-            results['source'].isin(shocked_nodes) & results['target'].isin(shocked_nodes),
-            'edge_type'
-        ] = 'internal'
+        
+        # Mark directly shocked edges
+        if shocked_edges:
+            results.loc[results['edge_key'].isin(shocked_edges), 'edge_type'] = 'shocked_edge'
+        
+        # Mark edges connected to shocked nodes (if not already marked as shocked edge)
+        if shocked_nodes:
+            results.loc[
+                (results['source'].isin(shocked_nodes)) & (results['edge_type'] == 'indirect'),
+                'edge_type'
+            ] = 'direct_outgoing'
+            results.loc[
+                (results['target'].isin(shocked_nodes)) & (results['edge_type'] == 'indirect'),
+                'edge_type'
+            ] = 'direct_incoming'
+            results.loc[
+                (results['source'].isin(shocked_nodes)) & 
+                (results['target'].isin(shocked_nodes)) & 
+                (results['edge_type'] == 'indirect'),
+                'edge_type'
+            ] = 'internal'
         
         # Compute impact magnitude (by absolute dollars)
         results['abs_change'] = np.abs(results['absolute_change'])
         
         return results.sort_values('abs_change', ascending=False)
     
-    def print_summary(self, results: pd.DataFrame, shocked_nodes: List[str]):
+    def print_summary(self, results: pd.DataFrame, shocked_nodes: List[str] = None, 
+                     shocked_edges: List[str] = None):
         """Print comprehensive shock analysis summary"""
+        
+        if shocked_nodes is None:
+            shocked_nodes = []
+        if shocked_edges is None:
+            shocked_edges = []
         
         print("\n" + "="*80)
         print("SHOCK PROPAGATION ANALYSIS")
         print("="*80)
         
         # Format shocked nodes in plain English
-        shocked_names = [format_node_name(node, include_code=True) for node in shocked_nodes]
-        print(f"\nShocked Nodes:")
-        for name in shocked_names:
-            print(f"  • {name}")
+        if shocked_nodes:
+            shocked_names = [format_node_name(node, include_code=True) for node in shocked_nodes]
+            print(f"\nShocked Nodes:")
+            for name in shocked_names:
+                print(f"  • {name}")
+        
+        # Format shocked edges in plain English
+        if shocked_edges:
+            print(f"\nShocked Edges:")
+            for edge_spec in shocked_edges:
+                src, tgt = edge_spec.split('->')
+                src_name = format_node_name(src)
+                tgt_name = format_node_name(tgt)
+                print(f"  • {src_name} → {tgt_name}")
+        
         print(f"\nTotal Edges Analyzed: {len(results):,}")
         
         # Breakdown by edge type
         print("\n" + "-"*80)
-        print("DIRECT EFFECTS (Edges connected to shocked nodes)")
+        print("DIRECT EFFECTS")
         print("-"*80)
         
+        # Show shocked edges first if present
+        if shocked_edges:
+            subset = results[results['edge_type'] == 'shocked_edge']
+            if len(subset) > 0:
+                print(f"\nShocked Edges (Direct):")
+                print(f"  Count: {len(subset):,} edges")
+                print(f"  Total value at risk: ${subset['value_t'].sum():,.0f}")
+                print(f"  Mean % change: {subset['pct_change'].mean():.2f}%")
+                print(f"  Total absolute change: ${subset['absolute_change'].sum():,.0f}")
+                print(f"  Median % change: {subset['pct_change'].median():.2f}%")
+        
+        # Show node-connected edges
         for edge_type in ['direct_outgoing', 'direct_incoming', 'internal']:
             subset = results[results['edge_type'] == edge_type]
             if len(subset) == 0:
@@ -351,8 +471,10 @@ def main():
                        help="Path to trained model checkpoint")
     parser.add_argument("--graph", required=True,
                        help="Path to graph file (e.g., embeddings/graph_2021_labeled.pt)")
-    parser.add_argument("--shocked-nodes", nargs="+", required=True,
+    parser.add_argument("--shocked-nodes", nargs="+",
                        help="Node IDs to shock (e.g., ECU_AGR CHN_MFG)")
+    parser.add_argument("--shocked-edges", nargs="+",
+                       help="Edge specifications to shock (e.g., USA_C26->CHN_C26)")
     parser.add_argument("--magnitude", type=float, default=0.5,
                        help="Shock magnitude as fraction (0.5 = 50%% reduction)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -444,19 +566,40 @@ def main():
     # Initialize simulator
     simulator = ShockSimulator(model, graph, args.device)
     
+    # Validate that at least one shock type is specified
+    if not args.shocked_nodes and not args.shocked_edges:
+        print("Error: Must specify either --shocked-nodes or --shocked-edges (or both)")
+        return
+    
     # Run simulation
     print(f"\n{'='*80}")
-    print(f"SIMULATING SHOCK: {args.magnitude:.1%} reduction in {len(args.shocked_nodes)} nodes")
+    shock_desc = []
+    if args.shocked_nodes:
+        shock_desc.append(f"{len(args.shocked_nodes)} nodes")
+    if args.shocked_edges:
+        shock_desc.append(f"{len(args.shocked_edges)} edges")
+    print(f"SIMULATING SHOCK: {args.magnitude:.1%} reduction in {' and '.join(shock_desc)}")
     print(f"{'='*80}")
     
-    shock_mask = simulator.create_shock_mask(args.shocked_nodes)
     # Convert magnitude to negative (reduction)
     shock_magnitude = -abs(args.magnitude)
-    predictions = simulator.run_simulation(shock_mask, shock_magnitude=shock_magnitude)
-    results = simulator.analyze_results(predictions, args.shocked_nodes)
+    
+    # Create shock masks
+    shock_mask_nodes = None
+    shock_mask_edges = None
+    
+    if args.shocked_nodes:
+        shock_mask_nodes = simulator.create_shock_mask(args.shocked_nodes, shock_magnitude)
+    
+    if args.shocked_edges:
+        shock_mask_edges = simulator.create_edge_shock_mask(args.shocked_edges, shock_magnitude)
+    
+    # Run simulation
+    predictions = simulator.run_simulation(shock_mask_nodes, shock_mask_edges)
+    results = simulator.analyze_results(predictions, args.shocked_nodes, args.shocked_edges)
     
     # Print summary
-    simulator.print_summary(results, args.shocked_nodes)
+    simulator.print_summary(results, args.shocked_nodes, args.shocked_edges)
     
     # Save detailed results to CSV if requested
     if args.output:
@@ -469,9 +612,11 @@ def main():
     
     # Save summary statistics
     summary = {
-        'shocked_nodes': args.shocked_nodes,
+        'shocked_nodes': args.shocked_nodes if args.shocked_nodes else [],
+        'shocked_edges': args.shocked_edges if args.shocked_edges else [],
         'magnitude': args.magnitude,
         'total_edges': len(results),
+        'shocked_edge_count': len(results[results['edge_type'] == 'shocked_edge']),
         'direct_outgoing': len(results[results['edge_type'] == 'direct_outgoing']),
         'direct_incoming': len(results[results['edge_type'] == 'direct_incoming']),
         'indirect': len(results[results['edge_type'] == 'indirect']),

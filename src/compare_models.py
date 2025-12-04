@@ -128,7 +128,7 @@ def evaluate_model_on_year(model_path, year, embeddings_dir="embeddings"):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--models-dir", type=str, default="models/loss_comparison_20251105_151803")
+    parser.add_argument("--models-dir", type=str, default="models")
     parser.add_argument("--models-to-compare", type=str, default="focal_model,sign_corrected_model,hybrid_model")
     parser.add_argument("--years", type=str, default="2003,2008,2015,2019,2020,2021")
     args = parser.parse_args()

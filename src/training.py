@@ -129,8 +129,8 @@ class ShockPropagationGNN(torch.nn.Module):
             x: Node features [num_nodes, node_in_dim]
             edge_index: Edge connectivity [2, num_edges]
             edge_attr: Edge features [num_edges, edge_in_dim]
-            shock_mask_nodes: Binary [num_nodes] - 1 if node is shocked
-            shock_mask_edges: Binary [num_edges] - 1 if edge is shocked
+            shock_mask_nodes: Shock magnitude [num_nodes] - actual % change (e.g., -0.20 for 20% drop)
+            shock_mask_edges: Shock magnitude [num_edges] - actual % change (e.g., -0.20 for 20% drop)
         
         Returns:
             delta_log_values: Predicted change in log(value) for each edge
@@ -138,21 +138,23 @@ class ShockPropagationGNN(torch.nn.Module):
         num_nodes = x.shape[0]
         num_edges = edge_attr.shape[0]
         
-        # Add shock indicators to node features
+        # Add shock magnitude to node features
         if shock_mask_nodes is None:
             shock_mask_nodes = torch.zeros(num_nodes, 1, device=x.device)
         else:
             shock_mask_nodes = shock_mask_nodes.view(-1, 1).float()
         
-        # Compute "downstream of shock" indicator (any neighbor is shocked)
+        # Compute "downstream of shock" indicator with magnitude awareness
+        # Propagate shock magnitude to 1-hop downstream neighbors
         src_idx, tgt_idx = edge_index
         downstream_indicator = torch.zeros(num_nodes, 1, device=x.device)
-        if shock_mask_nodes.sum() > 0:
-            # Propagate shock signal one hop
+        if shock_mask_nodes.abs().sum() > 0:
+            # Propagate actual shock magnitude (not just binary flag)
             downstream_indicator.scatter_add_(0, tgt_idx.unsqueeze(1), shock_mask_nodes[src_idx])
-            downstream_indicator = (downstream_indicator > 0).float()
+            # Clip to range of shock_mask_nodes for stability
+            downstream_indicator = torch.clamp(downstream_indicator, -1.0, 0.0)
         
-        # Augment node features: [original || is_shocked || has_shocked_supplier]
+        # Augment node features: [original || shock_magnitude || downstream_shock_magnitude]
         x_augmented = torch.cat([x, shock_mask_nodes, downstream_indicator], dim=1)
         
         x = self.node_encoder(x_augmented)
@@ -249,16 +251,33 @@ def create_shock_training_data(graph_years: List[int], embeddings_dir: str,
         graph = torch.load(path, map_location='cpu', weights_only=False)
         value_t, value_t1 = extract_edge_values(graph)
         pct_change = (value_t1 - value_t) / (value_t + 1e-8)
-        shock_mask_edges = (pct_change < -shock_threshold).float()
         
-        # Node shock mask: fraction of shocked outgoing edges > 0.2
+        # MAGNITUDE-BASED shock masks (not binary!)
+        # Edge shock mask: actual magnitude where dropped > threshold, else 0
+        shock_mask_edges = torch.where(
+            pct_change < -shock_threshold,
+            pct_change,  # Actual magnitude (e.g., -0.20 for 20% drop)
+            torch.zeros_like(pct_change)
+        )
+        
+        # Node shock mask: average magnitude of shocked outgoing edges
         src_idx, _ = graph.edge_index
         num_nodes = graph.x.shape[0]
-        shocked_out_degree = torch.zeros(num_nodes)
-        shocked_out_degree.scatter_add_(0, src_idx, shock_mask_edges)
-        out_degree = torch.zeros(num_nodes)
-        out_degree.scatter_add_(0, src_idx, torch.ones_like(shock_mask_edges))
-        shock_mask_nodes = (shocked_out_degree / (out_degree + 1e-8) > 0.2).float()
+        
+        # Sum of shock magnitudes per node
+        shock_magnitude_sum = torch.zeros(num_nodes)
+        shock_magnitude_sum.scatter_add_(0, src_idx, shock_mask_edges)
+        
+        # Count of shocked edges per node (for averaging)
+        num_shocked_edges = torch.zeros(num_nodes)
+        num_shocked_edges.scatter_add_(0, src_idx, (shock_mask_edges < 0).float())
+        
+        # Average shock magnitude (only for nodes with shocked edges)
+        shock_mask_nodes = torch.where(
+            num_shocked_edges > 0,
+            shock_magnitude_sum / (num_shocked_edges + 1e-8),
+            torch.zeros_like(shock_magnitude_sum)
+        )
         
         metadata = {
             'graph_path': str(path),
@@ -338,16 +357,29 @@ def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0
     shock_mask_edges = example_metadata.get('shock_mask_edges')
     shock_mask_nodes = example_metadata.get('shock_mask_nodes')
     if shock_mask_edges is None or shock_mask_nodes is None:
-        # Fallback to on-the-fly computation
+        # Fallback to on-the-fly computation (magnitude-based)
         pct_change = (value_t1 - value_t) / (value_t + 1e-8)
-        shock_mask_edges = (pct_change < -example_metadata['shock_threshold']).float()
+        shock_threshold = example_metadata['shock_threshold']
+        
+        # Edge shock mask: actual magnitude
+        shock_mask_edges = torch.where(
+            pct_change < -shock_threshold,
+            pct_change,
+            torch.zeros_like(pct_change)
+        )
+        
+        # Node shock mask: average magnitude of shocked edges
         src_idx, _ = graph.edge_index
         num_nodes = graph.x.shape[0]
-        shocked_out_degree = torch.zeros(num_nodes)
-        shocked_out_degree.scatter_add_(0, src_idx, shock_mask_edges)
-        out_degree = torch.zeros(num_nodes)
-        out_degree.scatter_add_(0, src_idx, torch.ones_like(shock_mask_edges))
-        shock_mask_nodes = (shocked_out_degree / (out_degree + 1e-8) > 0.2).float()
+        shock_magnitude_sum = torch.zeros(num_nodes)
+        shock_magnitude_sum.scatter_add_(0, src_idx, shock_mask_edges)
+        num_shocked_edges = torch.zeros(num_nodes)
+        num_shocked_edges.scatter_add_(0, src_idx, (shock_mask_edges < 0).float())
+        shock_mask_nodes = torch.where(
+            num_shocked_edges > 0,
+            shock_magnitude_sum / (num_shocked_edges + 1e-8),
+            torch.zeros_like(shock_magnitude_sum)
+        )
     
     # Choose sampling strategy
     if use_balanced and 'balanced_edge_idx' in example_metadata:
@@ -365,7 +397,8 @@ def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0
         num_edges = graph.edge_index.shape[1]
         num_sampled = int(num_edges * edge_sample_ratio)
         
-        shocked_edge_idx = torch.where(shock_mask_edges > 0)[0]
+        # Shocked edges now have negative magnitude values (not binary 1)
+        shocked_edge_idx = torch.where(shock_mask_edges < 0)[0]
         normal_edge_idx = torch.where(shock_mask_edges == 0)[0]
         
         # Keep all shocked edges
@@ -374,26 +407,24 @@ def load_and_process_example(example_metadata: Dict, device, edge_sample_ratio=0
         
         sampled_edge_idx = torch.cat([shocked_edge_idx, sampled_normal_idx]).long()
     
-    # Subsample graph
-    graph.edge_index = graph.edge_index[:, sampled_edge_idx]
-    graph.edge_attr = graph.edge_attr[sampled_edge_idx]
-    value_t = value_t[sampled_edge_idx]
-    value_t1 = value_t1[sampled_edge_idx]
-    shock_mask_edges = shock_mask_edges[sampled_edge_idx]
+    # Create mask for loss calculation instead of slicing graph
+    # This preserves graph structure for message passing!
+    loss_mask = torch.zeros(graph.edge_index.shape[1], dtype=torch.bool)
+    loss_mask[sampled_edge_idx] = True
     
-    # Compute deltas (node masks already precomputed)
+    # Compute deltas for ALL edges
     log_value_t = torch.log1p(value_t)
     log_value_t1 = torch.log1p(value_t1)
     delta_log_value = log_value_t1 - log_value_t
     
     src_idx, tgt_idx = graph.edge_index
-    num_nodes = graph.x.shape[0]
     
     return {
         'graph': graph.to(device),
         'shock_mask_nodes': shock_mask_nodes.to(device),
         'shock_mask_edges': shock_mask_edges.to(device),
         'target': delta_log_value.to(device),
+        'loss_mask': loss_mask.to(device),  # NEW: Use this to mask loss
         'value_t': value_t,
         'value_t1': value_t1,
         'year': example_metadata['year']
@@ -431,10 +462,21 @@ def train_epoch(model, optimizer, training_metadata, device, loss_fn, accumulati
             example['shock_mask_edges']
         )
         
-        if hasattr(loss_fn, 'name') and loss_fn.name.startswith("WeightedSign"):
-            loss = loss_fn(predictions, example['target'], example['value_t'])
+        # Apply loss mask (calculate loss only on sampled/balanced edges)
+        loss_mask = example.get('loss_mask')
+        if loss_mask is not None:
+            predictions_sampled = predictions[loss_mask]
+            target_sampled = example['target'][loss_mask]
+            value_t_sampled = example['value_t'][loss_mask] if example.get('value_t') is not None else None
         else:
-            loss = loss_fn(predictions, example['target'])
+            predictions_sampled = predictions
+            target_sampled = example['target']
+            value_t_sampled = example.get('value_t')
+        
+        if hasattr(loss_fn, 'name') and loss_fn.name.startswith("WeightedSign"):
+            loss = loss_fn(predictions_sampled, target_sampled, value_t_sampled)
+        else:
+            loss = loss_fn(predictions_sampled, target_sampled)
 
         loss = loss / accumulation_steps
         forward_time = time.time() - forward_start

@@ -16,7 +16,8 @@ D20,C20,Chemical and chemical products,20
 D21,C21,"Pharmaceuticals, medicinal chemical and botanical products",21
 D22,C22,Rubber and plastics products,22
 D23,C23,Other non-metallic mineral products,23
-D24,C24,Basic metals,24
+D24,C24A,Basic metals,24
+D24,C24B,Basic metals,24
 D25,C25,Fabricated metal products,25
 D26,C26,"Computer, electronic and optical equipment",26
 D27,C27,Electrical equipment,27
