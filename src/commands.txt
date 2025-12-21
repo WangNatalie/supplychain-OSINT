@@ -16,12 +16,21 @@ python feature_eng.py \
 # ============================================================================
 # Shock Simulation (with magnitude scaling fix)
 # ============================================================================
+# Edge shock
 python simulate_shock.py \
   --model models/magnitude/best_model.pt \
   --graph embeddings/graph_2021_labeled.pt \
-  --shocked-nodes USA_A01 \
+  --shocked-edges USA_C26->USA_C28 \
   --magnitude 0.20 \
   --output shock_analysis.csv
+
+
+# Node shock 
+python simulate_shock.py \
+  --model models/magnitude/best_model.pt \
+  --graph embeddings/graph_2021_labeled.pt \
+  --shocked-nodes USA_C26 \
+  --magnitude 0.20
 
 # Compare multiple shock scenarios
 python simulate_shock.py --model models/magnitude/best_model.pt \

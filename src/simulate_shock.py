@@ -276,7 +276,8 @@ class ShockSimulator:
         # Compute impact magnitude (by absolute dollars)
         results['abs_change'] = np.abs(results['absolute_change'])
         
-        return results.sort_values('abs_change', ascending=False)
+        # Sort by actual change (most negative first = biggest drops)
+        return results.sort_values('absolute_change', ascending=True)
     
     def print_summary(self, results: pd.DataFrame, shocked_nodes: List[str] = None, 
                      shocked_edges: List[str] = None):
@@ -346,16 +347,25 @@ class ShockSimulator:
         indirect = results[results['edge_type'] == 'indirect']
         
         if len(indirect) > 0:
-            significant_1pct = (np.abs(indirect['pct_change']) > 1).sum()
-            significant_5pct = (np.abs(indirect['pct_change']) > 5).sum()
-            significant_10pct = (np.abs(indirect['pct_change']) > 10).sum()
+            # Separate drops vs increases
+            drops = indirect[indirect['absolute_change'] < 0]
+            increases = indirect[indirect['absolute_change'] > 0]
             
-            print(f"\nEdges with significant propagation:")
-            print(f"  >1% change:  {significant_1pct:,} ({100*significant_1pct/len(indirect):.2f}%)")
-            print(f"  >5% change:  {significant_5pct:,} ({100*significant_5pct/len(indirect):.2f}%)")
-            print(f"  >10% change: {significant_10pct:,} ({100*significant_10pct/len(indirect):.2f}%)")
-            print(f"\n  Max indirect effect: {indirect['pct_change'].abs().max():.2f}%")
-            print(f"  Mean indirect effect: {indirect['pct_change'].mean():.2f}%")
+            print(f"\nOverall propagation:")
+            print(f"  Total edges affected: {len(indirect):,}")
+            print(f"  Edges with drops:     {len(drops):,} ({100*len(drops)/len(indirect):.1f}%)")
+            print(f"  Edges with increases: {len(increases):,} ({100*len(increases)/len(indirect):.1f}%)")
+            
+            significant_drop_1pct = (drops['pct_change'] < -1).sum()
+            significant_drop_5pct = (drops['pct_change'] < -5).sum()
+            significant_drop_10pct = (drops['pct_change'] < -10).sum()
+            
+            print(f"\nSignificant drops (indirect only):")
+            print(f"  >1% drop:  {significant_drop_1pct:,} ({100*significant_drop_1pct/len(indirect):.2f}%)")
+            print(f"  >5% drop:  {significant_drop_5pct:,} ({100*significant_drop_5pct/len(indirect):.2f}%)")
+            print(f"  >10% drop: {significant_drop_10pct:,} ({100*significant_drop_10pct/len(indirect):.2f}%)")
+            print(f"\n  Max drop: {drops['pct_change'].min():.2f}%" if len(drops) > 0 else "\n  Max drop: 0.00%")
+            print(f"  Mean effect: {indirect['pct_change'].mean():.2f}%")
             print(f"  Std dev: {indirect['pct_change'].std():.2f}%")
         
         # Country-level aggregation
@@ -430,32 +440,67 @@ class ShockSimulator:
                 row['pct_change']
             ))
         
-        # Top affected edges
+        # Top drops (largest decreases)
         print("\n" + "-"*80)
-        print("TOP 15 MOST AFFECTED TRADING FLOWS")
+        print("TOP 15 LARGEST DROPS IN TRADING FLOWS")
         print("-"*80)
         
-        top_edges = results.head(15)
+        # Get edges with negative changes only, sorted by most negative
+        drops_only = results[results['absolute_change'] < 0].head(15)
         
-        print("\n{:<40} {:<40} {:>15} {:>10}".format(
-            "Source", "Target", "$ Change", "% Change"
-        ))
-        print("-"*80)
-        for _, row in top_edges.iterrows():
-            # Format codes to plain English only for display
-            source_name = format_node_name(row['source'])
-            target_name = format_node_name(row['target'])
-            
-            # Truncate long names for display
-            source_display = source_name[:38] if len(source_name) > 38 else source_name
-            target_display = target_name[:38] if len(target_name) > 38 else target_name
-            
-            print("{:<40} {:<40} ${:>14,.0f} {:>9.2f}%".format(
-                source_display,
-                target_display,
-                row['absolute_change'],
-                row['pct_change']
+        if len(drops_only) > 0:
+            print("\n{:<40} {:<40} {:>15} {:>10}".format(
+                "Source", "Target", "$ Change", "% Change"
             ))
+            print("-"*80)
+            for _, row in drops_only.iterrows():
+                # Format codes to plain English only for display
+                source_name = format_node_name(row['source'])
+                target_name = format_node_name(row['target'])
+                
+                # Truncate long names for display
+                source_display = source_name[:38] if len(source_name) > 38 else source_name
+                target_display = target_name[:38] if len(target_name) > 38 else target_name
+                
+                print("{:<40} {:<40} ${:>14,.0f} {:>9.2f}%".format(
+                    source_display,
+                    target_display,
+                    row['absolute_change'],
+                    row['pct_change']
+                ))
+        else:
+            print("\n  No drops detected (all edges increased or unchanged)")
+        
+        # Top increases (largest gains)
+        print("\n" + "-"*80)
+        print("TOP 15 LARGEST INCREASES IN TRADING FLOWS")
+        print("-"*80)
+        
+        # Get edges with positive changes only, sorted by most positive
+        increases_only = results[results['absolute_change'] > 0].sort_values('absolute_change', ascending=False).head(15)
+        
+        if len(increases_only) > 0:
+            print("\n{:<40} {:<40} {:>15} {:>10}".format(
+                "Source", "Target", "$ Change", "% Change"
+            ))
+            print("-"*80)
+            for _, row in increases_only.iterrows():
+                # Format codes to plain English only for display
+                source_name = format_node_name(row['source'])
+                target_name = format_node_name(row['target'])
+                
+                # Truncate long names for display
+                source_display = source_name[:38] if len(source_name) > 38 else source_name
+                target_display = target_name[:38] if len(target_name) > 38 else target_name
+                
+                print("{:<40} {:<40} ${:>14,.0f} {:>9.2f}%".format(
+                    source_display,
+                    target_display,
+                    row['absolute_change'],
+                    row['pct_change']
+                ))
+        else:
+            print("\n  No increases detected (all edges decreased or unchanged)")
         
         print("\n" + "="*80)
 
@@ -610,24 +655,6 @@ def main():
         print(f"  Contains {len(results):,} edges (codes saved, use ICIO_parser.py to convert to plain English)")
         print(f"  Tip: Filter CSV first, then convert top results to plain English")
     
-    # Save summary statistics
-    summary = {
-        'shocked_nodes': args.shocked_nodes if args.shocked_nodes else [],
-        'shocked_edges': args.shocked_edges if args.shocked_edges else [],
-        'magnitude': args.magnitude,
-        'total_edges': len(results),
-        'shocked_edge_count': len(results[results['edge_type'] == 'shocked_edge']),
-        'direct_outgoing': len(results[results['edge_type'] == 'direct_outgoing']),
-        'direct_incoming': len(results[results['edge_type'] == 'direct_incoming']),
-        'indirect': len(results[results['edge_type'] == 'indirect']),
-        'total_impact': float(results['absolute_change'].sum()),
-        'mean_pct_change': float(results['pct_change'].mean()),
-        'median_pct_change': float(results['pct_change'].median()),
-        'edges_affected_1pct': int((np.abs(results['pct_change']) > 1).sum()),
-        'edges_affected_5pct': int((np.abs(results['pct_change']) > 5).sum()),
-        'edges_affected_10pct': int((np.abs(results['pct_change']) > 10).sum()),
-    }
-        
     print(f"\n{'='*80}")
     print("SIMULATION COMPLETE")
     print(f"{'='*80}\n")
