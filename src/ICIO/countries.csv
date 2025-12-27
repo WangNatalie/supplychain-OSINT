@@ -1,78 +1,78 @@
-﻿Code,Country
-ARG,Argentina
-AUS,Australia
-AUT,Austria
-BEL,Belgium
-BGD,Bangladesh
-BGR,Bulgaria
-BLR,Belarus
-BRA,Brazil
-BRN,Brunei Darussalam
-CAN,Canada
-CHE,Switzerland
-CHL,Chile
-CHN,China 
-CIV,Côte d'Ivoire
-CMR,Cameroon
-COL,Colombia
-CRI,Costa Rica
-CYP,Cyprus
-CZE,Czechia
-DEU,Germany
-DNK,Denmark
-EGY,Egypt
-ESP,Spain
-EST,Estonia
-FIN,Finland
-FRA,France
-GBR,United Kingdom
-GRC,Greece
-HKG,Hong Kong
-HRV,Croatia
-HUN,Hungary
-IDN,Indonesia
-IND,India
-IRL,Ireland
-ISL,Iceland
-ISR,Israel
-ITA,Italy
-JOR,Jordan
-JPN,Japan
-KAZ,Kazakhstan
-KHM,Cambodia
-KOR,Korea
-LAO,Laos
-LTU,Lithuania
-LUX,Luxembourg
-LVA,Latvia
-MAR,Morocco
-MEX,Mexico
-MLT,Malta
-MMR,Myanmar
-MYS,Malaysia
-NGA,Nigeria
-NLD,Netherlands
-NOR,Norway
-NZL,New Zealand
-PAK,Pakistan
-PER,Peru
-PHL,Philippines
-POL,Poland
-PRT,Portugal
-ROU,Romania
-RUS,Russia
-SAU,Saudi Arabia
-SEN,Senegal
-SGP,Singapore
-SVK,Slovakia
-SVN,Slovenia
-SWE,Sweden
-THA,Thailand
-TUN,Tunisia
-TUR,Turkey
-TWN,Chinese Taipei
-UKR,Ukraine
-USA,United States
-VNM,Vietnam
-ZAF,South Africa
-ROW,Rest of the World
+﻿Code,Country,M49
+ARG,Argentina,032
+AUS,Australia,036
+AUT,Austria,040
+BEL,Belgium,056
+BGD,Bangladesh,050
+BGR,Bulgaria,100
+BLR,Belarus,112
+BRA,Brazil,076
+BRN,Brunei Darussalam,096
+CAN,Canada,124
+CHE,Switzerland,756
+CHL,Chile,152
+CHN,China,156
+CIV,Côte d'Ivoire,384
+CMR,Cameroon,120
+COL,Colombia,170
+CRI,Costa Rica,188
+CYP,Cyprus,196
+CZE,Czechia,203
+DEU,Germany,276
+DNK,Denmark,208
+EGY,Egypt,818
+ESP,Spain,724
+EST,Estonia,233
+FIN,Finland,246
+FRA,France,250
+GBR,United Kingdom,826
+GRC,Greece,300
+HKG,Hong Kong,344
+HRV,Croatia,191
+HUN,Hungary,348
+IDN,Indonesia,360
+IND,India,356
+IRL,Ireland,372
+ISL,Iceland,352
+ISR,Israel,376
+ITA,Italy,380
+JOR,Jordan,400
+JPN,Japan,392
+KAZ,Kazakhstan,398
+KHM,Cambodia,116
+KOR,Korea,410
+LAO,Laos,418
+LTU,Lithuania,440
+LUX,Luxembourg,442
+LVA,Latvia,428
+MAR,Morocco,504
+MEX,Mexico,484
+MLT,Malta,470
+MMR,Myanmar,104
+MYS,Malaysia,458
+NGA,Nigeria,566
+NLD,Netherlands,528
+NOR,Norway,578
+NZL,New Zealand,554
+PAK,Pakistan,586
+PER,Peru,604
+PHL,Philippines,608
+POL,Poland,616
+PRT,Portugal,620
+ROU,Romania,642
+RUS,Russia,643
+SAU,Saudi Arabia,682
+SEN,Senegal,686
+SGP,Singapore,702
+SVK,Slovakia,703
+SVN,Slovenia,705
+SWE,Sweden,752
+THA,Thailand,764
+TUN,Tunisia,788
+TUR,Turkey,792
+TWN,Chinese Taipei,158
+UKR,Ukraine,804
+USA,United States,842
+VNM,Vietnam,704
+ZAF,South Africa,710
+ROW,Rest of the World,0

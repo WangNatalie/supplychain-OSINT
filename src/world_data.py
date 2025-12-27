@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 import wbgapi as wb
 import logging
+from typing import Optional, List
 
 # Configure logging
 logging.basicConfig(
@@ -125,22 +126,67 @@ def fill_with_region_mean(external, indicators, year):
 
     return external
 
-def load_indicators(year: int, nodes: pd.Index) -> pd.DataFrame:
+def load_single_indicator(wb_code: str, col_name: str, year: int, nodes: pd.Index, 
+                         countries: pd.Series, unique_countries: np.ndarray) -> pd.Series:
     """
-    Load selective external data for given year.
-    Only includes high-impact economic indicators for supply chain analysis.
+    Load a single World Bank indicator
     
-    Priority indicators (6 features):
-    1. GDP per capita (log) - Economic capacity
-    2. GDP growth - Economic momentum  
-    3. Exports % GDP - Trade openness (exports)
-    4. Imports % GDP - Import dependency
-    5. Trade % GDP - Overall trade exposure
-    6. Inflation - Economic instability
+    Args:
+        wb_code: World Bank indicator code (e.g., 'NY.GDP.PCAP.CD')
+        col_name: Column name for the indicator (e.g., 'gdp_per_capita')
+        year: Year to load data for
+        nodes: Index of node labels
+        countries: Series mapping nodes to country codes
+        unique_countries: Array of unique country codes
+    
+    Returns:
+        Series with indicator values indexed by nodes
+    """
+    try:
+        # Fetch country data: returns DataFrame with country codes as index
+        df = wb.data.DataFrame(wb_code, unique_countries, time=year)
+
+        # Handle different return formats from World Bank API
+        if str(year) in df.columns:
+            country_series = df[str(year)]
+        elif year in df.columns:
+            country_series = df[year]
+        elif len(df.columns) == 1:
+            country_series = df.iloc[:, 0]
+        else:
+            # Try to find the year column by matching
+            year_cols = [c for c in df.columns if str(year) in str(c)]
+            if year_cols:
+                country_series = df[year_cols[0]]
+            else:
+                raise KeyError(f"Could not find year {year} in columns: {df.columns.tolist()}")
+        
+        # Map directly: countries maps node->country, then map country->value
+        return countries.map(country_series)
+        
+    except Exception as e:
+        logger.error(f"  ✗ {col_name} ({wb_code}): {type(e).__name__} - {e}")
+        return pd.Series(np.nan, index=nodes)
+
+
+def load_indicators(year: int, nodes: pd.Index, 
+                   indicator_list: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    Load economic indicators for given year and nodes.
+    
+    Available indicators:
+    - 'gdp_per_capita' (auto log-transformed to 'log_gdp_per_capita')
+    - 'gdp_growth'
+    - 'exports_pct_gdp'
+    - 'imports_pct_gdp'
+    - 'trade_pct_gdp'
+    - 'inflation'
+    - 'unemployment_rate'
     
     Args:
         year: Year to load data for
-        nodes: Index of node labels (e.g., ['USA_MFG', 'CHN_SVC', ...])
+        nodes: Index of node labels (e.g., ['USA_C29', 'CHN_C26', ...])
+        indicator_list: List of indicator names to load. If None, loads all.
     
     Returns:
         DataFrame indexed by node labels with country-level features broadcasted
@@ -151,10 +197,8 @@ def load_indicators(year: int, nodes: pd.Index) -> pd.DataFrame:
         countries = pd.Series([n.split('_')[0] for n in nodes], index=nodes)
         unique_countries = countries.unique()
         
-        logger.info(f"Loading indicators for {year} - {len(unique_countries)} countries")
-        
-        # World Bank indicator codes
-        indicators = {
+        # World Bank indicator codes mapping
+        ALL_INDICATORS = {
             'NY.GDP.PCAP.CD': 'gdp_per_capita',
             'NY.GDP.MKTP.KD.ZG': 'gdp_growth', 
             'NE.EXP.GNFS.ZS': 'exports_pct_gdp',
@@ -162,44 +206,25 @@ def load_indicators(year: int, nodes: pd.Index) -> pd.DataFrame:
             'NE.TRD.GNFS.ZS': 'trade_pct_gdp',
             'NY.GDP.DEFL.KD.ZG': 'inflation',
             'SL.UEM.TOTL.ZS': 'unemployment_rate',
-            # Not enough data for account balance, tariffs, etc.
         }
+        
+        # Filter to requested indicators
+        if indicator_list is not None:
+            indicators = {k: v for k, v in ALL_INDICATORS.items() if v in indicator_list}
+        else:
+            indicators = ALL_INDICATORS
+        
+        logger.info(f"Loading {len(indicators)} indicators for {year} - {len(unique_countries)} countries")
         
         external = pd.DataFrame(index=nodes)
         success_count = 0
         
+        # Load each indicator individually
         for wb_code, col_name in indicators.items():
-            try:
-                # Fetch country data: returns DataFrame with country codes as index
-                df = wb.data.DataFrame(wb_code, unique_countries, time=year)
-
-                # Handle different return formats from World Bank API
-                if str(year) in df.columns:
-                    country_series = df[str(year)]
-                elif year in df.columns:
-                    country_series = df[year]
-                elif len(df.columns) == 1:
-                    country_series = df.iloc[:, 0]
-                else:
-                    # Try to find the year column by matching
-                    year_cols = [c for c in df.columns if str(year) in str(c)]
-                    if year_cols:
-                        country_series = df[year_cols[0]]
-                    else:
-                        raise KeyError(f"Could not find year {year} in columns: {df.columns.tolist()}")
-                
-                # Map directly: countries maps node->country, then map country->value
-                external[col_name] = countries.map(country_series)
+            series = load_single_indicator(wb_code, col_name, year, nodes, countries, unique_countries)
+            external[col_name] = series
+            if not series.isna().all():
                 success_count += 1
-                
-            except KeyError as e:
-                logger.error(f"  ✗ {col_name} ({wb_code}): Column key error - {e}")
-                logger.error(f"    Available columns: {df.columns.tolist() if 'df' in locals() else 'N/A'}")
-                external[col_name] = np.nan
-                
-            except Exception as e:
-                logger.error(f"  ✗ {col_name} ({wb_code}): {type(e).__name__} - {e}")
-                external[col_name] = np.nan
         
         logger.info(f"Successfully loaded {success_count}/{len(indicators)} indicators")
         
