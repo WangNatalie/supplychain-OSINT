@@ -238,9 +238,11 @@ class ICIOHelper:
         self._graph_cache[year] = graph
         return graph
 
-    def get_downstream_partners(self, shocked_node: str, year: int, top_k: int) -> List[Dict]:
+    def get_downstream_partners(self, shocked_node: str, year: int, top_k: int = 10) -> List[Dict]:
         """
         Identify top downstream partners from ICIO table.
+
+        NOTE: This returns FOREIGN partners only (targets in a different country than the shocked node).
 
         Returns list of dicts:
           - target_node
@@ -253,6 +255,7 @@ class ICIOHelper:
         if shocked_node not in graph.node_id_to_idx:
             raise ValueError(f"Node {shocked_node} not found in {year} ICIO table")
 
+        shocked_country = shocked_node.split("_", 1)[0]
         shocked_idx = graph.node_id_to_idx[shocked_node]
         src_indices, tgt_indices = graph.edge_index
         outgoing_mask = src_indices == shocked_idx
@@ -267,6 +270,9 @@ class ICIOHelper:
                 continue
             tgt_country, tgt_sector = tgt_node.split("_", 1)
             if tgt_country == "ROW":
+                continue
+            # Keep FOREIGN downstream partners only (skip domestic).
+            if tgt_country == shocked_country:
                 continue
 
             downstream.append(

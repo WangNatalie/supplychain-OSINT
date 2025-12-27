@@ -15,7 +15,7 @@ Usage:
         --shocks shocks/shock_events.json \
         --icio-dir embeddings \
         --output shocks/training_data.csv \
-        --top-k 20
+        --top-k 10
 """
 
 import json
@@ -47,11 +47,11 @@ from world_data import load_indicators
 class ShockDatasetBuilder:
     """Build training dataset from shock events"""
     
-    def __init__(self, icio_dir: str, top_k: int = 20):
+    def __init__(self, icio_dir: str, top_k: int = 10):
         """
         Args:
             icio_dir: Directory containing ICIO graph files
-            top_k: Number of top downstream partners to track
+            top_k: Number of top downstream partners to track (FOREIGN only; see ICIOHelper.get_downstream_partners)
         """
         self.icio_dir = Path(icio_dir)
         self.top_k = top_k
@@ -85,8 +85,8 @@ class ShockDatasetBuilder:
         print(f"Shocked node: {format_node_name(shocked_node)}")
         print(f"Date: {shock_date}")
         
-        # Step 1: Get downstream partners from ICIO
-        print(f"\nStep 1: Identifying top {self.top_k} downstream partners from ICIO {shock_year}...")
+        # Step 1: Get downstream partners from ICIO (FOREIGN only)
+        print(f"\nStep 1: Identifying top {self.top_k} FOREIGN downstream partners from ICIO {shock_year}...")
         downstream = self.icio.get_downstream_partners(shocked_node, shock_year, self.top_k)
         
         print(f"Found {len(downstream)} downstream partners:")
@@ -478,8 +478,8 @@ def main():
                        help='Directory containing ICIO graph files')
     parser.add_argument('--output', default='shocks/training_data.csv',
                        help='Output path for training dataset')
-    parser.add_argument('--top-k', type=int, default=20,
-                       help='Number of top downstream partners to track')
+    parser.add_argument('--top-k', type=int, default=10,
+                       help='Number of top FOREIGN downstream partners to track')
     
     args = parser.parse_args()
     
