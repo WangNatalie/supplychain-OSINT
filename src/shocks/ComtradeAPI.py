@@ -75,16 +75,25 @@ class ComtradeAPI:
         
         try:
             # Step 1: Load ICIO sector → ISIC Rev.4 mapping
-            industries_df = pd.read_csv(industries_path)
+            # Force ISIC column to string to avoid losing leading zeros (e.g., '07' -> '7')
+            industries_df = pd.read_csv(industries_path, dtype={"ISIC Rev.4": str})
             sector_to_isic = {}
             for _, row in industries_df.iterrows():
                 sector_code = row['Code']
                 isic_code = str(row['ISIC Rev.4']).strip()
+                isic_code = isic_code.split(".")[0]
+                if isic_code.isdigit() and len(isic_code) == 1:
+                    isic_code = isic_code.zfill(2)   # "7" -> "07"
                 
                 # Handle ranges like "69 to 75"
-                if 'to' in isic_code:
-                    start, end = isic_code.split('to')
-                    isic_codes = [str(i) for i in range(int(start.strip()), int(end.strip()) + 1)]
+                if "to" in isic_code:
+                    start, end = isic_code.split("to")
+                    isic_codes = []
+                    for i in range(int(start.strip()), int(end.strip()) + 1):
+                        s = str(i)
+                        if len(s) == 1:
+                            s = s.zfill(2)
+                        isic_codes.append(s)
                 else:
                     isic_codes = [isic_code]
                 
@@ -93,11 +102,25 @@ class ComtradeAPI:
                 sector_to_isic[sector_code].extend(isic_codes)
             
             # Step 2: Load ISIC Rev.4 → HS4 mapping
-            h4_df = pd.read_csv(h4_to_isic_path)
+            # Force string types so we preserve leading zeros in HS4 and ISIC codes
+            # (e.g., HS4 '0101', ISIC '0729').
+            h4_df = pd.read_csv(h4_to_isic_path, dtype={"HS4": str, "ISIC Rev. 4": str})
             isic_to_hs = {}
             for _, row in h4_df.iterrows():
                 hs4 = str(row['HS4']).strip()
+                # Normalize HS4: keep 4 digits (e.g., '101' -> '0101')
+                if hs4.isdigit() and len(hs4) < 4:
+                    hs4 = hs4.zfill(4)
+
                 isic_full = str(row['ISIC Rev. 4']).strip()
+                # Normalize ISIC: remove float artifacts + preserve leading zeros.
+                # We keep 2-digit codes as-is; pad 1-digit to 2; pad 3-digit to 4.
+                isic_full = isic_full.split(".")[0].strip()
+                if isic_full.isdigit():
+                    if len(isic_full) == 1:
+                        isic_full = isic_full.zfill(2)
+                    elif len(isic_full) == 3:
+                        isic_full = isic_full.zfill(4)
                 
                 # Extract first 2-3 digits for matching
                 # ISIC codes like "2910" → match to "29" or "2910"

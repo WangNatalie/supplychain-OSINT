@@ -84,6 +84,18 @@ class ShockDatasetBuilder:
         
         print(f"Shocked node: {format_node_name(shocked_node)}")
         print(f"Date: {shock_date}")
+
+        # Debug: show HS4 codes used for shocked sector when querying Comtrade imports (foreign targets).
+        # Helps diagnose "No import data available" cases due to missing/oversized mappings.
+        hs_codes_csv = self.api.get_hs_codes_for_sector(shocked_sector)
+        if hs_codes_csv:
+            hs_list = [c for c in str(hs_codes_csv).split(",") if c]
+            preview_n = 25
+            preview = ",".join(hs_list[:preview_n])
+            suffix = "..." if len(hs_list) > preview_n else ""
+            print(f"[HS MAP] Shock sector {shocked_sector} → {len(hs_list)} HS4 codes (preview): {preview}{suffix}")
+        else:
+            print(f"[HS MAP] Shock sector {shocked_sector} → (no HS mapping found) → Comtrade will use cmdCode=TOTAL")
         
         # Step 1: Get downstream partners from ICIO (FOREIGN only)
         print(f"\nStep 1: Identifying top {self.top_k} FOREIGN downstream partners from ICIO {shock_year}...")
