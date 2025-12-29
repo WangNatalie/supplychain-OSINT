@@ -243,6 +243,7 @@ class ICIOHelper:
         Identify top downstream partners from ICIO table.
 
         NOTE: This returns FOREIGN partners only (targets in a different country than the shocked node).
+        NOTE: This returns at most ONE partner per target country (largest edge per country).
 
         Returns list of dicts:
           - target_node
@@ -260,7 +261,8 @@ class ICIOHelper:
         src_indices, tgt_indices = graph.edge_index
         outgoing_mask = src_indices == shocked_idx
 
-        downstream = []
+        # Keep only the largest edge per target country
+        best_by_country: Dict[str, Dict] = {}
         for i in torch.where(outgoing_mask)[0]:
             tgt_idx = tgt_indices[i].item()
             tgt_node = graph.node_labels[tgt_idx]
@@ -275,15 +277,17 @@ class ICIOHelper:
             if tgt_country == shocked_country:
                 continue
 
-            downstream.append(
-                {
-                    "target_node": tgt_node,
-                    "target_country": tgt_country,
-                    "target_sector": tgt_sector,
-                    "edge_value": edge_value,
-                }
-            )
+            rec = {
+                "target_node": tgt_node,
+                "target_country": tgt_country,
+                "target_sector": tgt_sector,
+                "edge_value": edge_value,
+            }
+            prev = best_by_country.get(tgt_country)
+            if prev is None or edge_value > float(prev["edge_value"]):
+                best_by_country[tgt_country] = rec
 
+        downstream = list(best_by_country.values())
         downstream.sort(key=lambda x: x["edge_value"], reverse=True)
         return downstream[:top_k]
 
