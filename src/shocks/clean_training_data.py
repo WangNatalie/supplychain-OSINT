@@ -19,6 +19,10 @@ from typing import Optional
 import pandas as pd
 
 
+MIN_ROWS_PER_EVENT = 5
+EVENT_COL = "shock_event"
+
+
 def _bool_count(series: pd.Series) -> dict:
     s = series.dropna()
     if s.empty:
@@ -71,6 +75,12 @@ def clean_training_df(
         if require_target_col not in out.columns:
             raise ValueError(f"Missing required target column `{require_target_col}`.")
         out = out[out[require_target_col].notna()]
+
+    # Final cleanup: drop underpowered events after ALL other filters
+    if EVENT_COL in out.columns:
+        vc = out[EVENT_COL].value_counts()
+        keep_events = set(vc[vc >= MIN_ROWS_PER_EVENT].index.astype(str))
+        out = out[out[EVENT_COL].astype(str).isin(keep_events)]
 
     return out
 
@@ -140,6 +150,11 @@ def main() -> None:
         print(f"Input:  {n0} rows | shock_yoy_change>0: {pct_pos:.1%} | missing: {miss:.1%}")
     if "is_domestic" in df.columns:
         print(f"Input:  is_domestic counts: {_bool_count(df['is_domestic'])}")
+    if EVENT_COL in df.columns:
+        before = int(df[EVENT_COL].nunique())
+        after = int(cleaned[EVENT_COL].nunique()) if len(cleaned) else 0
+        # This is the *post-filter* event pruning, so it's helpful to surface explicitly.
+        print(f"Event filter: dropped events with <{MIN_ROWS_PER_EVENT} rows (after all filters): {before} → {after}")
     print(f"Output: {n1} rows → {out_path}")
 
 
