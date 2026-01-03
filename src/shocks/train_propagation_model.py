@@ -253,8 +253,14 @@ def make_preprocessor(*, scale_numeric: bool) -> ColumnTransformer:
 def make_models(random_state: int = 42) -> Dict[str, Pipeline]:
     models: Dict[str, Pipeline] = {}
 
-    # Avoid HistGradientBoostingRegressor here because it can rely on OpenMP runtime
-    # features (shared memory) that may not be available in some constrained environments.
+    from sklearn.linear_model import Ridge  # type: ignore
+    models["ridge"] = Pipeline(
+        steps=[
+            ("pre", make_preprocessor(scale_numeric=True)),
+            ("model", Ridge(alpha=10.0, random_state=random_state)),
+        ]
+    )
+    
     models["gbrt"] = Pipeline(
         steps=[
             ("pre", make_preprocessor(scale_numeric=False)),

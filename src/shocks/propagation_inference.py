@@ -40,6 +40,28 @@ def _parse_country(node: str) -> str:
     parts = str(node).split("_", 1)
     return parts[0] if parts else ""
 
+def _months_bucket(months_after_shock: int) -> str:
+    """
+    Bucket months_after_shock the same way as training (`add_derived_columns`).
+    """
+    try:
+        mi = int(months_after_shock)
+    except Exception:
+        return "NA"
+    if mi <= 0:
+        return "0"
+    if mi == 1:
+        return "1"
+    if mi == 2:
+        return "2"
+    if 3 <= mi <= 5:
+        return "3_5"
+    if 6 <= mi <= 8:
+        return "6_8"
+    if 9 <= mi <= 12:
+        return "9_12"
+    return "13_plus"
+
 
 @dataclass(frozen=True)
 class PropagationModelPaths:
@@ -94,17 +116,44 @@ class PropagationPredictor:
         target_unemployment_rate: Optional[float] = None,
         shock_month: Optional[int] = None,
     ) -> pd.DataFrame:
+        shock_yoy_change_f = float(shock_yoy_change) if shock_yoy_change is not None else None
+        shock_value_f = float(shock_value) if shock_value is not None else None
+
+        # Derived features (mirror training)
+        shock_value_x_shocked_share = (
+            float(shock_value_f) * float(shocked_supplier_share)
+            if shock_value_f is not None
+            else None
+        )
+        shock_yoy_change_x_shocked_share = (
+            float(shock_yoy_change_f) * float(shocked_supplier_share)
+            if shock_yoy_change_f is not None
+            else None
+        )
+        shock_value_x_diversification = (
+            float(shock_value_f) * (1.0 - float(supplier_hhi))
+            if shock_value_f is not None
+            else None
+        )
+
         # Derived categorical features
         row: Dict[str, Any] = {
+            # Explicit categorical features that were present at training time
+            "target_node": str(target_node),
+            "shock_node": str(shock_node),
             "target_country": target_country,
             "target_sector": _parse_sector(target_node),
             "shock_country": _parse_country(shock_node),
             "shock_sector": _parse_sector(shock_node),
             "is_domestic": str(bool(is_domestic)),
             "obs_month": f"{int(observation_month):02d}",
+            "months_bucket": _months_bucket(months_after_shock),
             # Numeric
-            "shock_yoy_change": shock_yoy_change,
-            "shock_value": shock_value,
+            "shock_yoy_change": shock_yoy_change_f,
+            "shock_value": shock_value_f,
+            "shock_value_x_shocked_share": shock_value_x_shocked_share,
+            "shock_yoy_change_x_shocked_share": shock_yoy_change_x_shocked_share,
+            "shock_value_x_diversification": shock_value_x_diversification,
             "icio_edge_value": icio_edge_value,
             "supplier_hhi": supplier_hhi,
             "shocked_supplier_share": shocked_supplier_share,

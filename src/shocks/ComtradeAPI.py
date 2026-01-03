@@ -4,6 +4,12 @@ from pathlib import Path
 import pandas as pd
 from typing import Dict, List, Optional
 import comtradeapicall
+import io
+import contextlib
+import json
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class ComtradeAPI:
     """UN Comtrade API wrapper using comtradeapicall package"""
