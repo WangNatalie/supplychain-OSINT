@@ -104,7 +104,6 @@ class PropagationPredictor:
         target_country: str,
         months_after_shock: int,
         observation_month: int,
-        is_domestic: bool,
         shock_yoy_change: Optional[float],
         shock_value: Optional[float],
         icio_edge_value: float,
@@ -145,7 +144,6 @@ class PropagationPredictor:
             "target_sector": _parse_sector(target_node),
             "shock_country": _parse_country(shock_node),
             "shock_sector": _parse_sector(shock_node),
-            "is_domestic": str(bool(is_domestic)),
             "obs_month": f"{int(observation_month):02d}",
             "months_bucket": _months_bucket(months_after_shock),
             # Numeric
@@ -181,7 +179,6 @@ class PropagationPredictor:
         target_country: str,
         months_after_shock: int,
         observation_month: int,
-        is_domestic: bool,
         # user-specified counterfactual shock severity
         shock_yoy_change: Optional[float] = None,
         shock_value: Optional[float] = None,
@@ -209,7 +206,6 @@ class PropagationPredictor:
             target_country=target_country,
             months_after_shock=months_after_shock,
             observation_month=observation_month,
-            is_domestic=is_domestic,
             shock_yoy_change=shock_yoy_change,
             shock_value=shock_value,
             icio_edge_value=icio_edge_value,

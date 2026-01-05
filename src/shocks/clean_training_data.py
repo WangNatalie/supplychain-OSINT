@@ -40,7 +40,6 @@ def clean_training_df(
     drop_positive_import_yoy: bool = True,
     drop_missing_import_yoy: bool = False,
     require_nonnegative_months_after_shock: bool = True,
-    keep_foreign_only: bool = False,
     require_target_col: Optional[str] = None,
 ) -> pd.DataFrame:
     """
@@ -49,7 +48,6 @@ def clean_training_df(
         drop_positive_import_yoy: Drop rows where shock_yoy_change > 0.
         drop_missing_import_yoy: Drop rows where shock_yoy_change is NaN.
         require_nonnegative_months_after_shock: Drop rows with months_after_shock < 0 (if present).
-        keep_foreign_only: If `is_domestic` exists, keep only False rows.
         require_target_col: If provided, drop rows where this column is NaN (useful for labels).
     """
     out = df.copy()
@@ -67,9 +65,6 @@ def clean_training_df(
     if require_nonnegative_months_after_shock and "months_after_shock" in out.columns:
         out = out[out["months_after_shock"].fillna(0) >= 0]
 
-    if keep_foreign_only and "is_domestic" in out.columns:
-        # Keep rows explicitly marked as False.
-        out = out[out["is_domestic"] == False]  # noqa: E712
 
     if require_target_col is not None:
         if require_target_col not in out.columns:
@@ -110,11 +105,6 @@ def main() -> None:
         help="Also drop rows with missing shock_yoy_change (default: keep).",
     )
     parser.add_argument(
-        "--foreign-only",
-        action="store_true",
-        help="If `is_domestic` exists, keep only foreign rows (is_domestic == False).",
-    )
-    parser.add_argument(
         "--require-target-col",
         type=str,
         default=None,
@@ -135,7 +125,6 @@ def main() -> None:
         df,
         drop_positive_import_yoy=not args.keep_positive_import_yoy,
         drop_missing_import_yoy=args.drop_missing_import_yoy,
-        keep_foreign_only=args.foreign_only,
         require_target_col=args.require_target_col,
     )
     n1 = len(cleaned)
@@ -148,8 +137,6 @@ def main() -> None:
         pct_pos = float((df["shock_yoy_change"] > 0).mean())
         miss = float(df["shock_yoy_change"].isna().mean())
         print(f"Input:  {n0} rows | shock_yoy_change>0: {pct_pos:.1%} | missing: {miss:.1%}")
-    if "is_domestic" in df.columns:
-        print(f"Input:  is_domestic counts: {_bool_count(df['is_domestic'])}")
     if EVENT_COL in df.columns:
         before = int(df[EVENT_COL].nunique())
         after = int(cleaned[EVENT_COL].nunique()) if len(cleaned) else 0

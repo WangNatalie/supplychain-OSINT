@@ -244,7 +244,19 @@ class ComtradeAPI:
                     includeDesc=True
                 )
 
-                if df is None or df.empty:
+                if df is None:
+                    continue
+                # comtradeapicall may return an error payload dict instead of a DataFrame
+                if not isinstance(df, pd.DataFrame):
+                    if verbose:
+                        try:
+                            err = df.get("error")  # type: ignore[union-attr]
+                        except Exception:
+                            err = None
+                    if err:
+                        print(f"  [COMTRADE ERROR] {reporter}->{partner} periods={chunk[0]}..{chunk[-1]}: {err}")
+                        continue
+                if df.empty:
                     continue
 
                 value_col = None
@@ -256,11 +268,18 @@ class ComtradeAPI:
                     print(f"  Warning: No value column found for {reporter}<-{partner} (periods={len(chunk)})")
                     continue
 
-                if "period" not in df.columns:
+                # Period column name differs across comtradeapicall / endpoints.
+                # Prefer "period" but fall back to commonly-seen alternatives.
+                period_col = None
+                for c in ["period", "refPeriodId", "periodId", "refPeriodCode", "timePeriod"]:
+                    if c in df.columns:
+                        period_col = c
+                        break
+                if not period_col:
                     # Can't map to months; skip
                     continue
 
-                for period_str, g in df.groupby("period"):
+                for period_str, g in df.groupby(period_col):
                     p = str(period_str)
                     if len(p) < 6:
                         continue

@@ -105,7 +105,7 @@ class ShockDatasetBuilder:
         for i, partner in enumerate(downstream, 1):
             print(f"  {i}. {format_node_name(partner['target_node'])} - ${partner['edge_value']:,.0f}")
         
-        baseline_year = baseline_year_for(shock_year)
+        indicators_year = baseline_year_for(shock_year)
 
         target_nodes = [partner['target_node'] for partner in downstream]
         
@@ -119,10 +119,10 @@ class ShockDatasetBuilder:
         
         print(
             f"\nStep 2: Loading {len(needed_indicators)} World Bank indicators for "
-            f"{len(target_nodes)} downstream partners ({baseline_year})..."
+            f"{len(target_nodes)} downstream partners ({indicators_year})..."
         )
         try:
-            indicators_df = load_indicators(baseline_year, pd.Index(target_nodes), indicator_list=needed_indicators)
+            indicators_df = load_indicators(indicators_year, pd.Index(target_nodes), indicator_list=needed_indicators)
             print(f"✓ Loaded {len(indicators_df.columns)} economic indicators")
         except Exception as e:
             print(f"  Failed to load economic indicators: {e}")
@@ -135,7 +135,8 @@ class ShockDatasetBuilder:
         
         # Load graph once for all partners (used for weight calculations)
         shock_graph = self.icio.load_graph(shock_year)
-        baseline_graph = self.icio.load_graph(baseline_year)
+        # Rolling t-12 baseline implies a baseline graph from the prior year (annual ICIO).
+        baseline_graph = self.icio.load_graph(shock_year - 1)
 
         # NOTE: `month_keys()` + `get_import_shock_series()` live in `shock_helpers.py`
         
@@ -149,9 +150,7 @@ class ShockDatasetBuilder:
             target_sector = partner['target_sector']
             
             print(f"\n  Partner: {format_node_name(target_node)}")
-            # Domestic vs foreign ONLY affects how we source shock/baseline import series
-            is_domestic = (target_country == shocked_country)
-            print("    [DOMESTIC] Shock from ICIO" if is_domestic else f"    [FOREIGN] Shock from Comtrade imports ({target_country} from {shocked_country} {shocked_sector})")
+            print(f"    [FOREIGN] Shock from Comtrade imports ({target_country} from {shocked_country} {shocked_sector})")
 
             # Print supplier metrics + economic indicators ONCE per partner
             supplier_metrics = self.supplier_metrics.compute_supplier_metrics(target_node, shocked_node, shock_year)
@@ -170,13 +169,12 @@ class ShockDatasetBuilder:
                 if 'unemployment_rate' in indicators.index:
                     econ_parts.append(f"unemployment={indicators['unemployment_rate']:.1f}%")
                 # if econ_parts:
-                    # print(f"    Economic indicators ({baseline_year}): {', '.join(econ_parts)}")
+                    # print(f"    Economic indicators ({indicators_year}): {', '.join(econ_parts)}")
             else:
                 print("    Economic indicators: Not available")
 
             series = get_import_shock_series(
                 api=self.api,
-                is_domestic=is_domestic,
                 target_country=target_country,
                 target_node=target_node,
                 shocked_country=shocked_country,
@@ -184,7 +182,6 @@ class ShockDatasetBuilder:
                 shocked_node=shocked_node,
                 shock_year=shock_year,
                 shock_month=shock_month,
-                baseline_year=baseline_year,
                 shock_graph=shock_graph,
                 baseline_graph=baseline_graph,
             )
@@ -197,8 +194,8 @@ class ShockDatasetBuilder:
             for i, date_key in enumerate(shock_keys_12):
                 if i == 0:
                     continue
-                _month = date_key.split("-")[1]
-                baseline_key = f"{baseline_year}-{_month}"
+                _year, _month = date_key.split("-")
+                baseline_key = f"{int(_year) - 1}-{_month}"
                 if date_key in country_imports_shock and baseline_key in country_imports_baseline:
                     shock_val = country_imports_shock[date_key]
                     base_val = country_imports_baseline[baseline_key]
@@ -222,12 +219,6 @@ class ShockDatasetBuilder:
                 months_to_query = shock_keys_12.index(recovery_month) + 1
             
             # print(f"    [WEIGHT] Calculating industry weight for {shocked_node} to {target_node}...")
-            if is_domestic:
-                # Domestic shock series is already the direct ICIO edge (industry-specific),
-                # so do NOT re-weight it (avoid double allocation).
-                icio_weight = 1.0
-                print("      Domestic flow: using icio_weight=100.0%")
-            else:
                 icio_weight = self.icio.calculate_industry_weight(target_node, shocked_node, shock_graph)
             
             # Query PROPAGATION VALUE (target industry's total exports)
@@ -253,14 +244,14 @@ class ShockDatasetBuilder:
 
             shock_keys = month_keys(shock_year, shock_month, months_to_query)
             industry_exports_shock, industry_exports_baseline = slice_shock_and_baseline(
-                industry_exports_all, shock_keys, baseline_year
+                industry_exports_all, shock_keys
             )
             
             if not industry_exports_shock or not industry_exports_baseline:
                 print(f"    ⚠️  No export data available for propagation measurement, skipping")
                 continue
 
-            # Seasonal decomposition expectations (fit on 3 years pre-shock)
+            # Seasonal decomposition expectations (fit on 2 years pre-shock)
             # Also request expected values for t-12 months so we can compute expected YoY growth deviations.
             lag_keys = [f"{int(k.split('-')[0]) - 1}-{k.split('-')[1]}" for k in shock_keys]
             forecast_keys_ext = sorted(set(shock_keys + lag_keys))
@@ -285,63 +276,66 @@ class ShockDatasetBuilder:
                     break  # Stop after shock recovers (A→B returns to baseline)
                 
                 year, month = date_key.split('-')
-                # Use same month from baseline year
-                baseline_key = f"{baseline_year}-{month}"
-                lag_key = f"{int(year) - 1}-{month}"
+                # Baseline: same calendar month 12 months earlier
+                t12_key = f"{int(year) - 1}-{month}"
                 
                 # Check if we have all required data for this month
-                if baseline_key not in industry_exports_baseline:
+                if t12_key not in industry_exports_baseline:
                     continue
-                if date_key not in country_imports_shock or baseline_key not in country_imports_baseline:
+                if date_key not in country_imports_shock or t12_key not in country_imports_baseline:
                     continue
                 
-                # SHOCK VALUE (shared logic for domestic/foreign; only the data source differs)
+                # SHOCK VALUE
                 import_shock = country_imports_shock[date_key]
-                import_baseline = country_imports_baseline[baseline_key]
+                import_baseline = country_imports_baseline[t12_key]
                 if import_baseline <= 0:
                     continue
                 import_yoy_change = (import_shock - import_baseline) / import_baseline
                 weighted_shock_value = (import_shock - import_baseline) * icio_weight
 
                 import_expected = import_expected_map.get(date_key)
-                import_expected_lag = import_expected_map.get(lag_key)
+                import_expected_lag = import_expected_map.get(t12_key)
                 shock_dev_abs = (import_shock - import_expected) if import_expected is not None else None
                 shock_dev_pct = (shock_dev_abs / import_expected) if (import_expected and import_expected > 0 and shock_dev_abs is not None) else None
                 shock_dev_z = (shock_dev_abs / import_resid_std) if (shock_dev_abs is not None and import_resid_std and import_resid_std > 0) else None
                 shock_dev_abs_weighted = (shock_dev_abs * icio_weight) if shock_dev_abs is not None else None
 
                 # YoY growth deviation (actual YoY vs expected YoY using t-12)
-                import_lag = imports_all.get(lag_key)
+                import_lag = imports_all.get(t12_key)
                 shock_yoy_actual = (import_shock - import_lag) / import_lag if (import_lag is not None and import_lag > 0) else None
-                shock_yoy_expected = (import_expected - import_expected_lag) / import_expected_lag if (import_expected is not None and import_expected_lag is not None and import_expected_lag > 0) else None
+                # Better expected YoY: anchor expected growth on OBSERVED t-12 value (import_lag),
+                # not on an "expected lag" which may be inaccurate.
+                shock_yoy_expected = (import_expected - import_lag) / import_lag if (import_expected is not None and import_lag is not None and import_lag > 0) else None
                 shock_yoy_dev = (shock_yoy_actual - shock_yoy_expected) if (shock_yoy_actual is not None and shock_yoy_expected is not None) else None
 
                 # YoY log-diff deviation
                 shock_logyoy_actual = (math.log1p(import_shock) - math.log1p(import_lag)) if (import_lag is not None and import_lag >= 0) else None
-                shock_logyoy_expected = (math.log1p(import_expected) - math.log1p(import_expected_lag)) if (import_expected is not None and import_expected_lag is not None and import_expected >= 0 and import_expected_lag >= 0) else None
+                shock_logyoy_expected = (math.log1p(import_expected) - math.log1p(import_lag)) if (import_expected is not None and import_lag is not None and import_expected >= 0 and import_lag >= 0) else None
                 shock_logyoy_dev = (shock_logyoy_actual - shock_logyoy_expected) if (shock_logyoy_actual is not None and shock_logyoy_expected is not None) else None
                 
                 # Calculate PROPAGATION VALUE (export change) - THIS IS THE TARGET
                 export_shock = industry_exports_shock[date_key]
-                export_baseline = industry_exports_baseline[baseline_key]
+                export_baseline = industry_exports_baseline[t12_key]
                 if export_baseline > 0:
                     propagation_value = (export_shock - export_baseline) / export_baseline
                 else:
                     continue
 
                 export_expected = export_expected_map.get(date_key)
-                export_expected_lag = export_expected_map.get(lag_key)
+                export_expected_lag = export_expected_map.get(t12_key)
                 prop_dev_abs = (export_shock - export_expected) if export_expected is not None else None
                 prop_dev_pct = (prop_dev_abs / export_expected) if (export_expected and export_expected > 0 and prop_dev_abs is not None) else None
                 prop_dev_z = (prop_dev_abs / export_resid_std) if (prop_dev_abs is not None and export_resid_std and export_resid_std > 0) else None
 
-                export_lag = industry_exports_all.get(lag_key)
+                export_lag = industry_exports_all.get(t12_key)
                 prop_yoy_actual = (export_shock - export_lag) / export_lag if (export_lag is not None and export_lag > 0) else None
-                prop_yoy_expected = (export_expected - export_expected_lag) / export_expected_lag if (export_expected is not None and export_expected_lag is not None and export_expected_lag > 0) else None
+                # Better expected YoY: anchor expected growth on OBSERVED t-12 value (export_lag),
+                # not on an "expected lag" which may be inaccurate.
+                prop_yoy_expected = (export_expected - export_lag) / export_lag if (export_expected is not None and export_lag is not None and export_lag > 0) else None
                 prop_yoy_dev = (prop_yoy_actual - prop_yoy_expected) if (prop_yoy_actual is not None and prop_yoy_expected is not None) else None
 
                 prop_logyoy_actual = (math.log1p(export_shock) - math.log1p(export_lag)) if (export_lag is not None and export_lag >= 0) else None
-                prop_logyoy_expected = (math.log1p(export_expected) - math.log1p(export_expected_lag)) if (export_expected is not None and export_expected_lag is not None and export_expected >= 0 and export_expected_lag >= 0) else None
+                prop_logyoy_expected = (math.log1p(export_expected) - math.log1p(export_lag)) if (export_expected is not None and export_lag is not None and export_expected >= 0 and export_lag >= 0) else None
                 prop_logyoy_dev = (prop_logyoy_actual - prop_logyoy_expected) if (prop_logyoy_actual is not None and prop_logyoy_expected is not None) else None
                 
                 # Create training sample
@@ -387,7 +381,6 @@ class ShockDatasetBuilder:
                     'prop_logyoy_dev': prop_logyoy_dev,
                     
                     'icio_edge_value': partner['edge_value'],
-                    'is_domestic': is_domestic,
                 }
                 
                 # Add supplier metrics (already computed above)

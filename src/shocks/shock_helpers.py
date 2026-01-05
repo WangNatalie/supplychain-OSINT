@@ -28,22 +28,34 @@ def month_keys(start_year: int, start_month: int, duration_months: int) -> List[
     return keys
 
 
+def _shift_month_key(key: str, delta_months: int) -> str:
+    """Shift a YYYY-MM key by delta_months."""
+    y, m = map(int, key.split("-"))
+    total = y * 12 + (m - 1) + int(delta_months)
+    ny = total // 12
+    nm = (total % 12) + 1
+    return f"{int(ny)}-{int(nm):02d}"
+
+
 def slice_shock_and_baseline(
     series_all: Dict[str, float],
     shock_keys: List[str],
-    baseline_year: int,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
-    """Slice a full series into shock-year keys and baseline-year same-month keys."""
-    baseline_keys = [f"{baseline_year}-{k.split('-')[1]}" for k in shock_keys]
+    """
+    Slice a full series into shock keys and their t-12 counterparts (rolling baseline).
+
+    Baseline month for each shock month is the same calendar month 12 months earlier
+    (i.e., dynamic per month, not a single baseline year).
+    """
+    baseline_keys = [_shift_month_key(k, -12) for k in shock_keys]
     shock = {k: series_all[k] for k in shock_keys if k in series_all}
-    base = {k: series_all[k] for k in baseline_keys if k in series_all}
+    base = {bk: series_all[bk] for bk in baseline_keys if bk in series_all}
     return shock, base
 
 
 def get_import_shock_series(
     *,
     api,
-    is_domestic: bool,
     target_country: str,
     target_node: str,
     shocked_country: str,
@@ -51,7 +63,6 @@ def get_import_shock_series(
     shocked_node: str,
     shock_year: int,
     shock_month: int,
-    baseline_year: int,
     shock_graph,
     baseline_graph,
     lookback_years: int = 2,
@@ -59,61 +70,16 @@ def get_import_shock_series(
     verbose: bool = True,
 ) -> Optional[Tuple[Dict[str, float], Dict[str, float], List[str], Dict[str, float]]]:
     """
-    Build shock/baseline import series with identical shapes for domestic/foreign targets.
+    Build shock/baseline import series with identical shapes for foreign targets.
 
     Returns:
       (imports_shock, imports_baseline, shock_keys_12, imports_all)
 
-    Domestic:
-      - Uses ICIO annual edge values -> monthly proxy (annual/12 repeated)
-      - Validates using annual YoY; returns None if annual_yoy >= 0
-
-    Foreign:
-      - Uses Comtrade mirror imports (reporter=target_country, partner=shocked_country) for shocked sector HS codes.
-      - Queries a wide range once and slices out shock and baseline windows.
+    Note: this helper currently always uses Comtrade mirror imports
+    (reporter=target_country, partner=shocked_country) for shocked sector HS codes.
     """
     shock_keys_12 = month_keys(shock_year, shock_month, 12)
-    baseline_keys_12 = [f"{baseline_year}-{k.split('-')[1]}" for k in shock_keys_12]
-
-    if is_domestic:
-        try:
-            shocked_idx = shock_graph.node_id_to_idx[shocked_node]
-            target_idx = shock_graph.node_id_to_idx[target_node]
-            src_i, tgt_i = shock_graph.edge_index
-            mask = (src_i == shocked_idx) & (tgt_i == target_idx)
-            shock_edge = shock_graph.value_t[mask].item() if mask.any() else 0.0
-
-            shocked_idx_b = baseline_graph.node_id_to_idx[shocked_node]
-            target_idx_b = baseline_graph.node_id_to_idx[target_node]
-            src_b, tgt_b = baseline_graph.edge_index
-            mask_b = (src_b == shocked_idx_b) & (tgt_b == target_idx_b)
-            base_edge = baseline_graph.value_t[mask_b].item() if mask_b.any() else 0.0
-
-            if base_edge <= 0:
-                return None
-
-            annual_yoy = (shock_edge - base_edge) / base_edge
-            print(f"      ICIO annual YoY: {annual_yoy:+.1%}")
-            if annual_yoy >= 0.0:
-                print(f"    ⚠️  Annual ICIO shows YoY change of {annual_yoy:+.1%} (recovery dominated), skipping")
-                return None
-
-            shock_m = shock_edge / 12.0
-            base_m = base_edge / 12.0
-            imports_shock = {k: shock_m for k in shock_keys_12}
-            imports_base = {k: base_m for k in baseline_keys_12}
-
-            # Synthetic "all series" (needed for downstream decomposition API shape).
-            # Since ICIO is annual, this is just a flat proxy series.
-            all_keys = month_keys(shock_year - lookback_years, shock_month, duration_months_total)
-            imports_all = {k: base_m for k in all_keys}
-            for k in shock_keys_12:
-                imports_all[k] = shock_m
-
-            return imports_shock, imports_base, shock_keys_12, imports_all
-        except Exception as e:
-            print(f"    ⚠️  Error processing domestic ICIO shock: {e}")
-            return None
+    # baseline_keys_12 computed implicitly via slice_shock_and_baseline
 
     hs_codes = api.get_hs_codes_for_sector(shocked_sector)
     imports_all = api.get_trade_data(
@@ -127,7 +93,7 @@ def get_import_shock_series(
         verbose=verbose,
     )
 
-    imports_shock, imports_base = slice_shock_and_baseline(imports_all, shock_keys_12, baseline_year)
+    imports_shock, imports_base = slice_shock_and_baseline(imports_all, shock_keys_12)
     return imports_shock, imports_base, shock_keys_12, imports_all
 
 
@@ -136,6 +102,65 @@ def _month_diff(start_key: str, end_key: str) -> int:
     sy, sm = map(int, start_key.split("-"))
     ey, em = map(int, end_key.split("-"))
     return (ey - sy) * 12 + (em - sm)
+
+
+def _seasonal_trend_forecast(
+    *,
+    series: pd.Series,
+    forecast_keys: List[str],
+    start_key: str,
+) -> Dict[str, float]:
+    """
+    Month-of-year seasonality + robust trend on log(y).
+
+    Model (log space):
+      log(y_t) ≈ intercept + slope * t + seasonal_offset[month(t)]
+
+    Where seasonal_offset[month] is the median residual for that calendar month in the pre-window.
+
+    Falls back to flat if <2 valid points.
+    """
+    notna = series.notna()
+    if int(notna.sum()) < 2:
+        val = float(series.dropna().iloc[-1]) if int(notna.sum()) else 0.0
+        return {k: val for k in forecast_keys}
+
+    t = np.arange(len(series), dtype=float)
+    idx = series.index
+    y = series.astype(float)
+
+    # log transform (guard against zeros/negatives): only fit on strictly positive values.
+    valid = notna & (y > 0)
+    if int(valid.sum()) < 2:
+        val = float(series.dropna().iloc[-1]) if int(notna.sum()) else 0.0
+        return {k: val for k in forecast_keys}
+
+    y_use = y[valid]
+    idx_use = idx[valid]
+    t_arr = pd.Series(t, index=idx)[valid].to_numpy(dtype=float)
+    logy = np.log(y_use.to_numpy(dtype=float))
+
+    # Robust-ish: clip logy to reduce outlier leverage.
+    if logy.size >= 10:
+        lo, hi = np.quantile(logy, [0.05, 0.95])
+        logy = np.clip(logy, lo, hi)
+
+    slope, intercept = np.polyfit(t_arr, logy, 1)
+
+    # Month-of-year offsets from residuals (median per month)
+    months = pd.Series(idx_use.month, index=idx_use)
+    resid = pd.Series(logy - (intercept + slope * t_arr), index=idx_use)
+    seasonal_offset_by_month = resid.groupby(months).median().to_dict()
+
+    out: Dict[str, float] = {}
+    for k in forecast_keys:
+        pos = float(_month_diff(start_key, k))
+        month_num = int(k.split("-")[1])
+        seas = float(seasonal_offset_by_month.get(month_num, 0.0))
+        pred_log = float(intercept + slope * pos + seas)
+        pred = float(np.exp(pred_log))
+        out[k] = pred if pred > 0 else 0.0
+    return out
 
 
 def expected_from_pre_shock(
@@ -162,8 +187,7 @@ def expected_from_pre_shock(
     missing_rate = float(s.isna().mean())
     # Too sparse => can't decompose reliably
     if missing_rate > 0.30:
-        last_valid = float(s.dropna().iloc[-1]) if s.dropna().size else 0.0
-        expected = {k: last_valid for k in forecast_keys}
+        expected = _seasonal_trend_forecast(series=s, forecast_keys=forecast_keys, start_key=pre_keys[0])
         return expected, 0.0
 
     # Fill small gaps only (avoid treating "not reported" as true zeros)
@@ -172,9 +196,9 @@ def expected_from_pre_shock(
     s = s.interpolate(limit=2, limit_direction="both")
     s = s.ffill().bfill()
 
-    # If series is constant or too short, expected is flat
+    # If series is constant or too short, use the seasonal+trend fallback
     if len(s) < seasonal_period * 2 or float(s.std()) == 0.0:
-        expected = {k: float(s.iloc[-1]) for k in forecast_keys}
+        expected = _seasonal_trend_forecast(series=s, forecast_keys=forecast_keys, start_key=pre_keys[0])
         return expected, 0.0
 
     fit = STL(s, period=seasonal_period, robust=True).fit()
@@ -198,9 +222,10 @@ def expected_from_pre_shock(
     trend_vals = np.asarray(trend, dtype=float)
     mask = ~np.isnan(trend_vals)
     if mask.sum() >= 2:
-        a, b = np.polyfit(t[mask], trend_vals[mask], 1)
+        slope, intercept = np.polyfit(t[mask], trend_vals[mask], 1)
     else:
-        a, b = float(trend_vals[mask][0]) if mask.sum() == 1 else float(s.mean()), 0.0
+        intercept = float(trend_vals[mask][0]) if mask.sum() == 1 else float(s.mean())
+        slope = 0.0
 
     # Seasonal pattern by calendar month (1-12)
     seasonal_vals = pd.Series(np.asarray(seasonal, dtype=float), index=idx)
@@ -213,7 +238,7 @@ def expected_from_pre_shock(
         pos = float(_month_diff(start_key, k))
         month_num = int(k.split("-")[1])
         seas = float(seasonal_by_month.get(month_num, 0.0))
-        expected[k] = float(a + b * pos + seas)
+        expected[k] = float(intercept + slope * pos + seas)
 
     return expected, resid_std
 
@@ -273,7 +298,7 @@ class ICIOHelper:
             tgt_country, tgt_sector = tgt_node.split("_", 1)
             if tgt_country == "ROW":
                 continue
-            # Keep FOREIGN downstream partners only (skip domestic).
+            # Keep FOREIGN downstream partners only 
             if tgt_country == shocked_country:
                 continue
 

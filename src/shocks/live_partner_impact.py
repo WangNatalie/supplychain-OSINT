@@ -20,30 +20,27 @@ Notes:
 from __future__ import annotations
 
 import argparse
-import math
 import json
+import sys
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from propagation_inference import PropagationPredictor
+from ICIO.ICIO_parser import format_node_name 
 from shock_helpers import (
     ICIOHelper,
     SupplierMetricsHelper,
-    baseline_year_for,
     expected_from_pre_shock,
     month_keys,
 )
 
-try:
-    # Local module (repo root adds `src/` in PYTHONPATH in typical usage; fallback below if needed).
-    from ComtradeAPI import ComtradeAPI  # type: ignore
-except Exception:  # pragma: no cover
-    from shocks.ComtradeAPI import ComtradeAPI  # type: ignore
+from ComtradeAPI import ComtradeAPI  
+from world_data import load_indicators  
 
 
 def _parse_country(node: str) -> str:
@@ -132,7 +129,6 @@ def _try_load_indicators(
         src_dir = here.parents[1]
         if str(src_dir) not in sys.path:
             sys.path.insert(0, str(src_dir))
-        from world_data import load_indicators  # type: ignore
 
         # world_data is intentionally chatty; keep scenario output readable.
         logging.getLogger("world_data").setLevel(logging.CRITICAL)
@@ -174,51 +170,50 @@ def _value(series: Dict[str, float], key: str) -> Optional[float]:
         return None
 
 
-def _safe_yoy(n: Optional[float], d: Optional[float]) -> Optional[float]:
-    if n is None or d is None or d <= 0:
-        return None
-    return (n - d) / d
 
 
-def _expected_yoy_from_history(
-    *,
-    series_all: Dict[str, float],
-    obs_key: str,
-    history_months: int,
-) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+
+def _summarize_impacts(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build a simple expectation model using `expected_from_pre_shock` over the last `history_months`
-    ending at obs_key-1 month, and compute expected_yoy for obs_key.
+    Aggregate impacts across hops: sum shock-attributable level deltas per target,
+    count occurrences, and collect hop levels.
 
-    Returns:
-      expected_yoy, y_lag_12, y_expected, y_pred_stub, y_observed
-
-    y_pred_stub is None here (we compute it after prop_yoy_dev prediction).
+    Summary intentionally excludes target_country (requested).
     """
-    oy, om = map(int, obs_key.split("-"))
-    lag_y, lag_m = _add_months(oy, om, -12)
-    lag_key = _ym_key(lag_y, lag_m)
+    agg: Dict[str, Dict[str, object]] = {}
+    for _, r in df.iterrows():
+        # Only keep nodes/rows with negative predicted YoY deviation (below expected growth).
+        dev = r.get("pred_prop_yoy_dev")
+        if dev is None or pd.isna(dev) or float(dev) >= 0:
+            continue
 
-    # Pre window ends at obs_key-1 month.
-    pre_end_y, pre_end_m = _add_months(oy, om, -1)
-    pre_keys = _month_range_ending(pre_end_y, pre_end_m, history_months)
-    forecast_keys = sorted({obs_key, lag_key})
+        node = r.get("target_node")
+        if node is None:
+            continue
+        node = str(node)
+        delta = r.get("shock_only_delta")
+        hop = int(r.get("hop", 0)) if r.get("hop") is not None else 0
+        if delta is None or pd.isna(delta):
+            continue
+        entry = agg.setdefault(node, {"total_shock_only_delta": 0.0, "count": 0, "hops": set()})
+        entry["total_shock_only_delta"] = float(entry["total_shock_only_delta"]) + float(delta)
+        entry["count"] = int(entry["count"]) + 1
+        entry["hops"].add(hop)
 
-    expected_map, _resid_std = expected_from_pre_shock(
-        series_all=series_all,
-        pre_keys=pre_keys,
-        forecast_keys=forecast_keys,
-    )
-
-    exp_obs = expected_map.get(obs_key)
-    exp_lag = expected_map.get(lag_key)
-    expected_yoy = _safe_yoy(exp_obs, exp_lag)
-
-    y_lag_12 = _value(series_all, lag_key)
-    y_observed = _value(series_all, obs_key)
-    y_expected = (y_lag_12 * (1.0 + expected_yoy)) if (y_lag_12 is not None and expected_yoy is not None) else None
-    return expected_yoy, y_lag_12, y_expected, None, y_observed
-
+    rows: List[Dict[str, object]] = []
+    for node, info in agg.items():
+        rows.append(
+            {
+                "target_name": format_node_name(node),
+                "total_shock_only_delta": float(info["total_shock_only_delta"]),
+                "occurrences": int(info["count"]),
+                "hops": sorted(info["hops"]),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    # Most negative total shock effect first
+    return pd.DataFrame(rows).sort_values("total_shock_only_delta", ascending=True).reset_index(drop=True)
 
 def run_scenario(
     *,
@@ -227,15 +222,21 @@ def run_scenario(
     embeddings_dir: Path,
     inputs: ScenarioInputs,
     use_network: bool,
+    hop: int = 0,
+    predictor: Optional[PropagationPredictor] = None,
+    icio: Optional[ICIOHelper] = None,
+    supplier: Optional[SupplierMetricsHelper] = None,
+    graph=None,
+    icio_year: Optional[int] = None,
 ) -> pd.DataFrame:
     # Model
-    predictor = PropagationPredictor(str(model_dir))
+    predictor = predictor or PropagationPredictor(str(model_dir))
 
     # ICIO features
-    icio_year = min(inputs.shock_year, _latest_graph_year(embeddings_dir))
-    icio = ICIOHelper(embeddings_dir)
-    graph = icio.load_graph(icio_year)
-    supplier = SupplierMetricsHelper(icio)
+    icio = icio or ICIOHelper(embeddings_dir)
+    icio_year = icio_year or min(inputs.shock_year, _latest_graph_year(embeddings_dir))
+    graph = graph or icio.load_graph(icio_year)
+    supplier = supplier or SupplierMetricsHelper(icio)
 
     # Candidate partners from ICIO
     downstream = icio.get_downstream_partners(inputs.shock_node, icio_year, top_k=inputs.candidates)
@@ -266,15 +267,13 @@ def run_scenario(
         target_country = str(partner["target_country"])
         target_sector = str(partner.get("target_sector") or _parse_sector(target_node))
         icio_edge_value = float(partner.get("edge_value", 0.0) or 0.0)
-        is_domestic = bool(target_country == shocked_country)
-
         # Supplier metrics
         sm = supplier.compute_supplier_metrics(target_node, inputs.shock_node, icio_year)
         supplier_hhi = float(sm.get("supplier_hhi", 1.0))
         shocked_supplier_share = float(sm.get("shocked_supplier_share", 0.0))
 
         # ICIO allocation weight (used when turning import delta into a target-sector shock_value)
-        icio_weight = 1.0 if is_domestic else float(ICIOHelper.calculate_industry_weight(target_node, inputs.shock_node, graph))
+        icio_weight = float(ICIOHelper.calculate_industry_weight(target_node, inputs.shock_node, graph))
 
         # Macros
         target_log_gdp_per_capita = fallbacks.get("target_log_gdp_per_capita")
@@ -298,7 +297,8 @@ def run_scenario(
         import_delta: Optional[float] = None
         if api is not None:
             # Need baseline for same month last year to convert user yoy->absolute delta.
-            baseline_year = inputs.shock_year - 1
+            # Baseline is t-12 relative to the observation month (handles year rollovers).
+            baseline_year = obs_year - 1
             baseline_key = f"{baseline_year}-{obs_month:02d}"
             base_series = api.get_trade_data(
                 reporter=target_country,
@@ -311,15 +311,18 @@ def run_scenario(
                 verbose=True,
             )
             import_baseline = _value(base_series, baseline_key)
-            if import_baseline is not None:
-                import_delta = import_baseline * float(inputs.shock_yoy_change)
-                shock_value = float(import_delta) * float(icio_weight)
-            else:
-                print(f"      [FALLBACK] Missing import baseline for {target_country}<-{shocked_country} at {baseline_key}; shock_value=None")
+            if import_baseline is None:
+                # If we can't anchor the absolute shock value, skip this node entirely.
+                print(f"      [SKIP] Missing import baseline for {target_country}<-{shocked_country} at {baseline_key}; skipping node")
+                continue
+
+            import_delta = import_baseline * float(inputs.shock_yoy_change)
+            shock_value = float(import_delta) * float(icio_weight)
 
         # Export history for target's TOTAL exports (sector-level) to the world
         export_series: Dict[str, float] = {}
         expected_yoy: Optional[float] = None
+        pred_yoy: Optional[float] = None
         y_lag_12: Optional[float] = None
         y_expected: Optional[float] = None
         y_observed: Optional[float] = None
@@ -348,16 +351,17 @@ def run_scenario(
                 pre_keys=pre_keys,
                 forecast_keys=forecast_keys_ext,
             )
-            export_expected = export_expected_map.get(obs_key)
-            export_expected_lag = export_expected_map.get(lag_key)
-            expected_yoy = (
-                (export_expected - export_expected_lag) / export_expected_lag
-                if (export_expected is not None and export_expected_lag is not None and export_expected_lag > 0)
-                else None
-            )
             y_lag_12 = _value(export_series, lag_key)
             y_observed = _value(export_series, obs_key)
-            y_expected = (float(y_lag_12) * (1.0 + float(expected_yoy))) if (y_lag_12 is not None and expected_yoy is not None) else None
+            export_expected = export_expected_map.get(obs_key)
+            # Realized baseline anchoring: expected_yoy is computed vs the OBSERVED t-12 value (y_lag_12),
+            # not vs an "expected lag" which may be inaccurate.
+            expected_yoy = (
+                (float(export_expected) - float(y_lag_12)) / float(y_lag_12)
+                if (export_expected is not None and y_lag_12 is not None and float(y_lag_12) > 0)
+                else None
+            )
+            y_expected = float(export_expected) if export_expected is not None else None
 
         # Predict propagation deviation
         pred_prop_yoy_dev = predictor.predict_prop_yoy_dev(
@@ -366,7 +370,6 @@ def run_scenario(
             target_country=target_country,
             months_after_shock=int(inputs.months_after_shock),
             observation_month=int(obs_month),
-            is_domestic=is_domestic,
             shock_yoy_change=float(inputs.shock_yoy_change),
             shock_value=shock_value,
             icio_edge_value=float(icio_edge_value),
@@ -384,7 +387,6 @@ def run_scenario(
             target_country=target_country,
             months_after_shock=int(inputs.months_after_shock),
             observation_month=int(obs_month),
-            is_domestic=is_domestic,
             shock_yoy_change=float(inputs.shock_yoy_change),
             shock_value=shock_value,
             icio_edge_value=float(icio_edge_value),
@@ -400,16 +402,21 @@ def run_scenario(
         # Convert to absolute delta in export value (if we have a baseline + expectation)
         export_delta_pred: Optional[float] = None
         y_pred: Optional[float] = None
+        shock_only_delta: Optional[float] = None
+        # Realized impact focus:
+        # - define predicted YoY vs observed t-12 baseline
+        # - compute predicted level directly from y_lag_12 (no counterfactual delta vs "expected level" needed)
         if y_lag_12 is not None and expected_yoy is not None:
-            export_delta_pred = PropagationPredictor.convert_dev_to_absolute_delta(
-                y_lag_12=float(y_lag_12),
-                expected_yoy=float(expected_yoy),
-                pred_prop_yoy_dev=float(pred_prop_yoy_dev),
-            )
-            y_pred = (float(y_expected) + float(export_delta_pred)) if y_expected is not None else None
+            pred_yoy = float(expected_yoy) + float(pred_prop_yoy_dev)
+            y_pred = float(y_lag_12) * (1.0 + float(pred_yoy))
+            export_delta_pred = float(y_pred) - float(y_lag_12)
+        # Shock-attributable level delta: (y_pred - y_expected) = y_lag_12 * pred_prop_yoy_dev
+        if y_lag_12 is not None and pred_prop_yoy_dev is not None:
+            shock_only_delta = float(y_lag_12) * float(pred_prop_yoy_dev)
 
         rows.append(
             {
+                "source_shock_node": inputs.shock_node,
                 "shock_node": inputs.shock_node,
                 "shock_year": int(inputs.shock_year),
                 "shock_month": int(inputs.shock_month),
@@ -431,6 +438,7 @@ def run_scenario(
                 "target_inflation": target_inflation,
                 "target_unemployment_rate": target_unemployment_rate,
                 "expected_yoy": expected_yoy,
+                "pred_yoy_change": pred_yoy,
                 "y_lag_12": y_lag_12,
                 "y_expected": y_expected,
                 "y_pred": y_pred,
@@ -438,20 +446,103 @@ def run_scenario(
                 "pred_prop_yoy_dev": float(pred_prop_yoy_dev),
                 "pred_prop_yoy_dev_pp": float(pred_prop_yoy_dev) * 100.0,
                 "pred_export_delta": export_delta_pred,
+                "shock_only_delta": shock_only_delta,
                 "model_features": feature_row,
             }
         )
 
     df_out = pd.DataFrame(rows)
+    df_out["hop"] = hop
     # Most negative deviation is "worst impact" (below expected growth)
     df_out = df_out.sort_values("pred_prop_yoy_dev", ascending=True).reset_index(drop=True)
     return df_out
 
 
+def run_multihop_scenario(
+    *,
+    model_dir: Path,
+    training_csv: Path,
+    embeddings_dir: Path,
+    inputs: ScenarioInputs,
+    use_network: bool,
+    hops: int,
+) -> pd.DataFrame:
+    """
+    Propagate shocks up to `hops` levels.
+
+    Gating rule (requested): only nodes with negative predicted YoY *deviation* spawn further propagation:
+      pred_prop_yoy_dev < 0
+    """
+    predictor = PropagationPredictor(str(model_dir))
+    icio = ICIOHelper(embeddings_dir)
+    icio_year = min(inputs.shock_year, _latest_graph_year(embeddings_dir))
+    graph = icio.load_graph(icio_year)
+    supplier = SupplierMetricsHelper(icio)
+
+    active: Dict[str, Dict[str, object]] = {
+        inputs.shock_node: {
+            "shock_node": inputs.shock_node,
+            "shock_yoy_change": inputs.shock_yoy_change,
+        }
+    }
+    all_rows: List[pd.DataFrame] = []
+
+    for hop in range(max(1, int(hops))):
+        if not active:
+            break
+        next_active: Dict[str, Dict[str, object]] = {}
+        for shock in active.values():
+            hop_inputs = ScenarioInputs(
+                shock_node=str(shock["shock_node"]),
+                shock_year=inputs.shock_year,
+                shock_month=inputs.shock_month,
+                shock_yoy_change=float(shock["shock_yoy_change"]),
+                months_after_shock=inputs.months_after_shock,
+                history_months=inputs.history_months,
+                candidates=inputs.candidates,
+            )
+            df_hop = run_scenario(
+                model_dir=model_dir,
+                training_csv=training_csv,
+                embeddings_dir=embeddings_dir,
+                inputs=hop_inputs,
+                use_network=use_network,
+                hop=hop,
+                predictor=predictor,
+                icio=icio,
+                supplier=supplier,
+                graph=graph,
+                icio_year=icio_year,
+            )
+            all_rows.append(df_hop)
+
+            for _, r in df_hop.iterrows():
+                dev = r.get("pred_prop_yoy_dev")
+                if dev is None or pd.isna(dev) or float(dev) >= 0:
+                    continue  # only propagate negative deviation
+
+                target_node = str(r["target_node"])
+                # Propagate the shock-attributable component (growth deviation), not the full predicted YoY.
+                # This aligns the gating rule (dev < 0) with what we pass downstream.
+                pred_yoy = float(dev)
+                # If multiple upstream shocks point to same node, propagate the most negative YoY.
+                existing = next_active.get(target_node)
+                if existing is None or float(pred_yoy) < float(existing["shock_yoy_change"]):
+                    next_active[target_node] = {
+                        "shock_node": target_node,
+                        "shock_yoy_change": float(pred_yoy),
+                    }
+        active = next_active
+
+    if not all_rows:
+        return pd.DataFrame()
+    return pd.concat(all_rows, ignore_index=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Predict top-k affected partners for a shock scenario.")
-    ap.add_argument("--model-dir", default="models/prop_yoy_dev", help="Directory containing model.joblib + feature_schema.json")
-    ap.add_argument("--training-csv", default="training_data_clean.csv", help="CSV used to compute fallback medians")
+    ap.add_argument("--model-dir", default="shocks/models/prop_yoy_dev", help="Directory containing model.joblib + feature_schema.json")
+    ap.add_argument("--training-csv", default="shocks/training_data_clean.csv", help="CSV used to compute fallback medians")
     ap.add_argument(
         "--embeddings-dir",
         default=str((Path(__file__).resolve().parents[1] / "embeddings").as_posix()),
@@ -469,6 +560,7 @@ def main() -> None:
     ap.add_argument("--months-after-shock", type=int, default=1, help="Forecast horizon in months after the shock month")
     ap.add_argument("--history-months", type=int, default=24, help="Months of export history used to estimate expected growth")
     ap.add_argument("--candidates", type=int, default=50, help="How many downstream partners to evaluate before ranking")
+    ap.add_argument("--hops", type=int, default=1, help="Number of propagation hops (>=1). Only negative shocks propagate.")
 
     ap.add_argument(
         "--no-network",
@@ -500,28 +592,51 @@ def main() -> None:
     training_csv = Path(args.training_csv)
     embeddings_dir = Path(args.embeddings_dir)
 
-    df = run_scenario(
-        model_dir=model_dir,
-        training_csv=training_csv,
-        embeddings_dir=embeddings_dir,
-        inputs=inputs,
-        use_network=not bool(args.no_network),
-    )
+    if int(args.hops) <= 1:
+        df = run_scenario(
+            model_dir=model_dir,
+            training_csv=training_csv,
+            embeddings_dir=embeddings_dir,
+            inputs=inputs,
+            use_network=not bool(args.no_network),
+            hop=0,
+        )
+    else:
+        df = run_multihop_scenario(
+            model_dir=model_dir,
+            training_csv=training_csv,
+            embeddings_dir=embeddings_dir,
+            inputs=inputs,
+            use_network=not bool(args.no_network),
+            hops=int(args.hops),
+        )
 
     # Print top-k with a stable set of columns
     cols = [
-        "target_node",
-        "target_country",
-        "icio_edge_value",
+        "target_name",
         "shocked_supplier_share",
         "supplier_hhi",
         "pred_prop_yoy_dev_pp",
         "y_observed",
-        "y_expected",
         "y_pred",
-        "pred_export_delta",
+        "y_lag_12",
+        "pred_yoy_change",
+        "shock_only_delta",
     ]
-    table = df[cols].copy()
+    display_cols = cols + (["hop"] if "hop" in df.columns else [])
+    df = df.copy()
+    df["target_name"] = df["target_node"].map(lambda n: format_node_name(str(n)) if (n is not None and pd.notna(n)) else "NA")
+    table = df[display_cols].copy()
+    table["pred_yoy_change"] = table["pred_yoy_change"].map(
+        lambda v: f"{float(v)*100.0:+.2f}%" if (v is not None and pd.notna(v)) else "NA"
+    )
+    table["pred_prop_yoy_dev_pp"] = table["pred_prop_yoy_dev_pp"].map(
+        lambda v: f"{float(v):.2f}%" if (v is not None and pd.notna(v)) else "NA"
+    )
+    table["shocked_supplier_share"] = table["shocked_supplier_share"].map(
+        lambda v: f"{float(v)*100.0:+.2f}%" if (v is not None and pd.notna(v)) else "NA"
+    )
+
     # readability
     pd.set_option("display.width", 180)
     pd.set_option("display.max_columns", 50)
@@ -534,6 +649,12 @@ def main() -> None:
         # Pretty-print as JSON per row for readability.
         for _, r in feat_rows.iterrows():
             print(f"- {r['target_node']} / {r['target_country']}: {json.dumps(r['model_features'], default=str)}")
+
+    summary = _summarize_impacts(df)
+    if not summary.empty:
+        top_summary = summary.head(20)
+        print("\nPropagation summary (top 20 most negative total impact):")
+        print(top_summary.to_string(index=False))
 
     if args.out_csv:
         out_path = Path(args.out_csv)

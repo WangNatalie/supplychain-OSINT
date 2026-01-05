@@ -103,7 +103,6 @@ FEATURE_SCHEMA = FeatureSchema(
         "shock_country",
         "shock_sector",
         "shock_node",
-        "is_domestic",
         "obs_month",
         "months_bucket",
     ),
@@ -176,7 +175,6 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["shock_value_x_diversification"] = df["shock_value"].astype(float) * (1.0 - df["supplier_hhi"].astype(float))
 
     # Stabilize types
-    df["is_domestic"] = df["is_domestic"].astype(str)
     df["shock_node"] = df["shock_node"].astype(str)
     df["target_node"] = df["target_node"].astype(str)
 
@@ -354,7 +352,7 @@ def eval_regression(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
 def slice_metrics(df_eval: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     """
     Produce a small set of sliced metrics for debugging stability.
-    df_eval requires: y_true, y_pred, months_after_shock, is_domestic, shocked_supplier_share
+    df_eval requires: y_true, y_pred, months_after_shock, shocked_supplier_share
     """
     out: Dict[str, Dict[str, float]] = {}
 
@@ -370,10 +368,6 @@ def slice_metrics(df_eval: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     df_eval["bucket"] = pd.cut(df_eval["months_after_shock"], bins=bins, labels=labels)
     for b in labels:
         _add(f"months_{b}", df_eval[df_eval["bucket"] == b])
-
-    # domestic vs foreign
-    _add("domestic_true", df_eval[df_eval["is_domestic"] == "True"])
-    _add("domestic_false", df_eval[df_eval["is_domestic"] == "False"])
 
     # high vs low exposure to shocked supplier (median split)
     med = float(df_eval["shocked_supplier_share"].median())
@@ -750,19 +744,39 @@ def main() -> None:
     with open(metrics_path, "w") as f:
         json.dump({"baseline_zero": {"groupkfold": baseline_gkf, "leave_one_event_out": baseline_loeo}, "models": results}, f, indent=2)
 
-    # LOEO fold-by-fold diagnostics for xgboost vs train-fold median baseline
+    # LOEO fold-by-fold diagnostics for BEST selected model vs BEST baseline (by LOEO mean MAE)
     try:
-        xgb_loeo = results.get("xgboost", {}).get("leave_one_event_out", {})
-        loeo_folds = xgb_loeo.get("fold_details", [])
+        best_loeo = results.get(str(best_name), {}).get("leave_one_event_out", {})
+        loeo_folds = best_loeo.get("fold_details", [])
         if loeo_folds:
-            # Recompute fold-wise train-median baseline aligned with LOEO folds (leakage-safe).
+            # Pick best baseline strategy under LOEO by mean MAE.
+            def _baseline_mae(b: dict) -> float:
+                try:
+                    return float(b["summary"]["mae"]["mean"])
+                except Exception:
+                    return float("inf")
+
+            best_baseline_name, _best_baseline = min(
+                baseline_loeo.items(),
+                key=lambda kv: _baseline_mae(kv[1]),
+            )
+
+            # Recompute fold-wise baseline aligned with LOEO folds (leakage-safe).
             logo2 = LeaveOneGroupOut()
-            baseline_rows = []
+            baseline_rows: List[Dict[str, object]] = []
             for fold_i, (train_idx, test_idx) in enumerate(logo2.split(X, y, groups=groups), 1):
                 y_train = y.iloc[train_idx]
                 y_test = y.iloc[test_idx].to_numpy()
-                med = float(y_train.median()) if len(y_train) else 0.0
-                y_pred = np.full_like(y_test, fill_value=med, dtype=float)
+
+                if best_baseline_name == "zero":
+                    c = 0.0
+                elif best_baseline_name == "train_mean":
+                    c = float(y_train.mean()) if len(y_train) else 0.0
+                else:
+                    # train_median
+                    c = float(y_train.median()) if len(y_train) else 0.0
+
+                y_pred = np.full_like(y_test, fill_value=c, dtype=float)
                 m = eval_regression(y_test, y_pred)
                 g = sorted(set(groups.iloc[test_idx].astype(str)))
                 baseline_rows.append({"fold": int(fold_i), "test_groups": g, "n_test": int(len(test_idx)), "metrics": m})
@@ -790,7 +804,7 @@ def main() -> None:
                 )
 
             rows.sort(key=lambda r: r["delta_mae"], reverse=True)
-            print("\nLOEO fold-by-fold: xgboost vs train_median baseline (worst ΔMAE first)")
+            print(f"\nLOEO fold-by-fold: {best_name} vs Baseline({best_baseline_name}) (worst ΔMAE first)")
             for r in rows[:15]:
                 print(
                     f"  {r['event']}: n={r['n']} | "
