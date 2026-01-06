@@ -189,8 +189,17 @@ class ShockDatasetBuilder:
                 continue
             country_imports_shock, country_imports_baseline, shock_keys_12, imports_all = series
 
-            # Detect recovery month using already-fetched series (skip shock month itself)
+            # Detect recovery month consistent with NEW shock definition:
+            # recovery when shock deviation vs expected is no longer negative (shock_yoy_dev >= 0),
+            # i.e. observed imports are back to (or above) expected imports.
             recovery_month = None
+            # Compute expected imports for the shock window once (STL/fallback on pre_keys).
+            # We anchor expected YoY on OBSERVED t-12 imports, consistent with shock_yoy_dev definition.
+            import_expected_recovery_map, _ = expected_from_pre_shock(
+                series_all=imports_all,
+                pre_keys=pre_keys,
+                forecast_keys=shock_keys_12,
+            )
             for i, date_key in enumerate(shock_keys_12):
                 if i == 0:
                     continue
@@ -199,11 +208,14 @@ class ShockDatasetBuilder:
                 if date_key in country_imports_shock and baseline_key in country_imports_baseline:
                     shock_val = country_imports_shock[date_key]
                     base_val = country_imports_baseline[baseline_key]
-                    if base_val > 0:
-                        yoy = (shock_val - base_val) / base_val
-                        if yoy >= 0.0:
+                    exp_val = import_expected_recovery_map.get(date_key)
+                    if base_val > 0 and exp_val is not None:
+                        shock_yoy_actual = (shock_val - base_val) / base_val
+                        shock_yoy_expected = (float(exp_val) - float(base_val)) / float(base_val)
+                        shock_yoy_dev = float(shock_yoy_actual) - float(shock_yoy_expected)
+                        if float(shock_yoy_dev) >= 0.0:
                             recovery_month = date_key
-                            print(f"      ✓ Recovery detected at {date_key} (imports {yoy:+.1%})")
+                            print(f"      ✓ Recovery detected at {date_key} (shock_yoy_dev {shock_yoy_dev:+.1%})")
                             break
             
             if not country_imports_shock or not country_imports_baseline:
@@ -219,7 +231,7 @@ class ShockDatasetBuilder:
                 months_to_query = shock_keys_12.index(recovery_month) + 1
             
             # print(f"    [WEIGHT] Calculating industry weight for {shocked_node} to {target_node}...")
-                icio_weight = self.icio.calculate_industry_weight(target_node, shocked_node, shock_graph)
+            icio_weight = self.icio.calculate_industry_weight(target_node, shocked_node, shock_graph)
             
             # Query PROPAGATION VALUE (target industry's total exports)
             # One query: 2 years pre-shock (same month) through 12 months after the shock month
@@ -285,13 +297,12 @@ class ShockDatasetBuilder:
                 if date_key not in country_imports_shock or t12_key not in country_imports_baseline:
                     continue
                 
-                # SHOCK VALUE
+                # SHOCK VALUE (imports: shock-only deviation vs expected)
                 import_shock = country_imports_shock[date_key]
                 import_baseline = country_imports_baseline[t12_key]
                 if import_baseline <= 0:
                     continue
-                import_yoy_change = (import_shock - import_baseline) / import_baseline
-                weighted_shock_value = (import_shock - import_baseline) * icio_weight
+                shock_yoy_actual = (import_shock - import_baseline) / import_baseline
 
                 import_expected = import_expected_map.get(date_key)
                 import_expected_lag = import_expected_map.get(t12_key)
@@ -302,7 +313,7 @@ class ShockDatasetBuilder:
 
                 # YoY growth deviation (actual YoY vs expected YoY using t-12)
                 import_lag = imports_all.get(t12_key)
-                shock_yoy_actual = (import_shock - import_lag) / import_lag if (import_lag is not None and import_lag > 0) else None
+                shock_yoy_actual = (import_shock - import_lag) / import_lag if (import_lag is not None and import_lag > 0) else shock_yoy_actual
                 # Better expected YoY: anchor expected growth on OBSERVED t-12 value (import_lag),
                 # not on an "expected lag" which may be inaccurate.
                 shock_yoy_expected = (import_expected - import_lag) / import_lag if (import_expected is not None and import_lag is not None and import_lag > 0) else None
@@ -349,8 +360,13 @@ class ShockDatasetBuilder:
                     'months_after_shock': (int(year) - shock_year) * 12 + (int(month) - shock_month),
                     
                     # SHOCK VALUE (input)
-                    'shock_yoy_change': import_yoy_change,
-                    'shock_value': weighted_shock_value,
+                    # Hard rename: use deviation-from-expected as the propagated shock rate feature.
+                    'shock_yoy_dev': shock_yoy_dev,
+                    # Option A: redefine shock_value as shock-only level delta (vs expected), allocated by ICIO weight.
+                    # shock_only_level_delta = import_lag * shock_yoy_dev
+                    'shock_value': (float(import_lag) * float(shock_yoy_dev) * float(icio_weight))
+                    if (import_lag is not None and shock_yoy_dev is not None)
+                    else None,
                     'shock_expected': import_expected,
                     'shock_dev_abs': shock_dev_abs,
                     'shock_dev_pct': shock_dev_pct,
@@ -359,7 +375,6 @@ class ShockDatasetBuilder:
                     'shock_resid_std': import_resid_std,
                     'shock_yoy_actual': shock_yoy_actual,
                     'shock_yoy_expected': shock_yoy_expected,
-                    'shock_yoy_dev': shock_yoy_dev,
                     'shock_logyoy_actual': shock_logyoy_actual,
                     'shock_logyoy_expected': shock_logyoy_expected,
                     'shock_logyoy_dev': shock_logyoy_dev,
@@ -395,7 +410,8 @@ class ShockDatasetBuilder:
                             sample[f'target_{col}'] = indicators[col]
                 
                 training_samples.append(sample)
-                print(f"      {date_key}: Import YoY={import_yoy_change:+.1%} → Export YoY={propagation_value:+.1%}")
+                imp_yoy_str = "NA" if shock_yoy_actual is None else f"{shock_yoy_actual:+.1%}"
+                print(f"      {date_key}: Import YoY={imp_yoy_str} → Export YoY={propagation_value:+.1%}")
                 shock_dev_pct_str = "NA" if shock_dev_pct is None else f"{shock_dev_pct:+.1%}"
                 shock_dev_z_str = "NA" if shock_dev_z is None else f"{shock_dev_z:+.2f}"
                 prop_dev_pct_str = "NA" if prop_dev_pct is None else f"{prop_dev_pct:+.1%}"

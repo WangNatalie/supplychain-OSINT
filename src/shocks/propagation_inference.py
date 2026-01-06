@@ -12,8 +12,8 @@ So a prediction of -0.12 means:
   - export YoY growth is predicted to be 12 percentage points below expected YoY growth.
 
 It supports counterfactual inputs:
-  - user-specified shock percentage: maps to feature `shock_yoy_change`
-  - user-specified absolute shock delta: maps to feature `shock_value` (Option A: treated as effective delta)
+  - shock rate (deviation from expected YoY): maps to feature `shock_yoy_dev`
+  - shock-only level delta: maps to feature `shock_value`
 """
 
 from __future__ import annotations
@@ -104,7 +104,7 @@ class PropagationPredictor:
         target_country: str,
         months_after_shock: int,
         observation_month: int,
-        shock_yoy_change: Optional[float],
+        shock_yoy_dev: Optional[float],
         shock_value: Optional[float],
         icio_edge_value: float,
         supplier_hhi: float,
@@ -115,7 +115,7 @@ class PropagationPredictor:
         target_unemployment_rate: Optional[float] = None,
         shock_month: Optional[int] = None,
     ) -> pd.DataFrame:
-        shock_yoy_change_f = float(shock_yoy_change) if shock_yoy_change is not None else None
+        shock_yoy_dev_f = float(shock_yoy_dev) if shock_yoy_dev is not None else None
         shock_value_f = float(shock_value) if shock_value is not None else None
 
         # Derived features (mirror training)
@@ -124,9 +124,9 @@ class PropagationPredictor:
             if shock_value_f is not None
             else None
         )
-        shock_yoy_change_x_shocked_share = (
-            float(shock_yoy_change_f) * float(shocked_supplier_share)
-            if shock_yoy_change_f is not None
+        shock_yoy_dev_x_shocked_share = (
+            float(shock_yoy_dev_f) * float(shocked_supplier_share)
+            if shock_yoy_dev_f is not None
             else None
         )
         shock_value_x_diversification = (
@@ -147,10 +147,10 @@ class PropagationPredictor:
             "obs_month": f"{int(observation_month):02d}",
             "months_bucket": _months_bucket(months_after_shock),
             # Numeric
-            "shock_yoy_change": shock_yoy_change_f,
+            "shock_yoy_dev": shock_yoy_dev_f,
             "shock_value": shock_value_f,
             "shock_value_x_shocked_share": shock_value_x_shocked_share,
-            "shock_yoy_change_x_shocked_share": shock_yoy_change_x_shocked_share,
+            "shock_yoy_dev_x_shocked_share": shock_yoy_dev_x_shocked_share,
             "shock_value_x_diversification": shock_value_x_diversification,
             "icio_edge_value": icio_edge_value,
             "supplier_hhi": supplier_hhi,
@@ -179,8 +179,8 @@ class PropagationPredictor:
         target_country: str,
         months_after_shock: int,
         observation_month: int,
-        # user-specified counterfactual shock severity
-        shock_yoy_change: Optional[float] = None,
+        # shock severity as deviation from expected YoY (shock-only)
+        shock_yoy_dev: Optional[float] = None,
         shock_value: Optional[float] = None,
         # exposure/static partner features
         icio_edge_value: float,
@@ -206,7 +206,7 @@ class PropagationPredictor:
             target_country=target_country,
             months_after_shock=months_after_shock,
             observation_month=observation_month,
-            shock_yoy_change=shock_yoy_change,
+            shock_yoy_dev=shock_yoy_dev,
             shock_value=shock_value,
             icio_edge_value=icio_edge_value,
             supplier_hhi=supplier_hhi,

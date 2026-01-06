@@ -3,7 +3,8 @@
 live_partner_impact.py
 
 Scenario runner on top of `propagation_inference.py`:
-- user provides: shocked node, shock month (present year by default), shock magnitude (shock_yoy_change)
+- user provides: shocked node, shock month (present year by default), shock magnitude as realized YoY
+- we convert realized YoY into a shock-only deviation vs expected YoY per target, and propagate deviations across hops
 - we compute partner exposure features from ICIO graphs
 - optionally query:
   - World Bank indicators (via `src/world_data.py`)
@@ -105,7 +106,8 @@ class ScenarioInputs:
     shock_node: str
     shock_year: int
     shock_month: int
-    shock_yoy_change: float
+    # User input at hop-0: realized YoY (vs observed t-12). At hop>=1 we pass deviations.
+    shock_yoy_actual: float
     months_after_shock: int
     history_months: int
     candidates: int
@@ -228,6 +230,7 @@ def run_scenario(
     supplier: Optional[SupplierMetricsHelper] = None,
     graph=None,
     icio_year: Optional[int] = None,
+    shock_is_dev: bool = False,
 ) -> pd.DataFrame:
     # Model
     predictor = predictor or PropagationPredictor(str(model_dir))
@@ -291,10 +294,14 @@ def run_scenario(
             if "unemployment_rate" in r.index and pd.notna(r["unemployment_rate"]):
                 target_unemployment_rate = float(r["unemployment_rate"])
 
-        # Shock value (absolute delta) from baseline import and user-provided shock_yoy_change
+        # Shock definition:
+        # - hop 0: user provides realized YoY; we compute expected import YoY and convert to deviation (shock-only)
+        # - hop>=1: we pass shock_yoy_dev directly (already a deviation)
         shock_value: Optional[float] = None
         import_baseline: Optional[float] = None
         import_delta: Optional[float] = None
+        shock_yoy_expected: Optional[float] = None
+        shock_yoy_dev: Optional[float] = None
         if api is not None:
             # Need baseline for same month last year to convert user yoy->absolute delta.
             # Baseline is t-12 relative to the observation month (handles year rollovers).
@@ -316,8 +323,43 @@ def run_scenario(
                 print(f"      [SKIP] Missing import baseline for {target_country}<-{shocked_country} at {baseline_key}; skipping node")
                 continue
 
-            import_delta = import_baseline * float(inputs.shock_yoy_change)
-            shock_value = float(import_delta) * float(icio_weight)
+            if shock_is_dev:
+                shock_yoy_dev = float(inputs.shock_yoy_actual)
+            else:
+                # Compute expected import YoY (for this target importer / shocked exporter / sector) from a pre-shock window.
+                # This lets us convert the user's realized YoY into a shock-only deviation, consistent with training.
+                pre_keys_imp = month_keys(inputs.shock_year - 2, inputs.shock_month, 24)
+                imp_hist = api.get_trade_data(
+                    reporter=target_country,
+                    partner=shocked_country,
+                    sector_code=shocked_sector,
+                    flow_code="M",
+                    start_year=inputs.shock_year - 2,
+                    start_month=inputs.shock_month,
+                    duration_months=24,
+                    verbose=False,
+                )
+                imp_expected_map, _ = expected_from_pre_shock(
+                    series_all=imp_hist,
+                    pre_keys=pre_keys_imp,
+                    forecast_keys=[obs_key],
+                )
+                imp_expected = imp_expected_map.get(obs_key)
+                shock_yoy_expected = (
+                    (float(imp_expected) - float(import_baseline)) / float(import_baseline)
+                    if (imp_expected is not None and float(import_baseline) > 0)
+                    else None
+                )
+                shock_yoy_dev = (
+                    float(inputs.shock_yoy_actual) - float(shock_yoy_expected)
+                    if shock_yoy_expected is not None
+                    else None
+                )
+
+            if shock_yoy_dev is not None and float(import_baseline) > 0:
+                # Option A: shock_value is the shock-only level delta (vs expected), allocated by ICIO weight.
+                import_delta = float(import_baseline) * float(shock_yoy_dev)
+                shock_value = float(import_delta) * float(icio_weight)
 
         # Export history for target's TOTAL exports (sector-level) to the world
         export_series: Dict[str, float] = {}
@@ -370,7 +412,7 @@ def run_scenario(
             target_country=target_country,
             months_after_shock=int(inputs.months_after_shock),
             observation_month=int(obs_month),
-            shock_yoy_change=float(inputs.shock_yoy_change),
+            shock_yoy_dev=shock_yoy_dev,
             shock_value=shock_value,
             icio_edge_value=float(icio_edge_value),
             supplier_hhi=float(supplier_hhi),
@@ -387,7 +429,7 @@ def run_scenario(
             target_country=target_country,
             months_after_shock=int(inputs.months_after_shock),
             observation_month=int(obs_month),
-            shock_yoy_change=float(inputs.shock_yoy_change),
+            shock_yoy_dev=shock_yoy_dev,
             shock_value=shock_value,
             icio_edge_value=float(icio_edge_value),
             supplier_hhi=float(supplier_hhi),
@@ -429,7 +471,9 @@ def run_scenario(
                 "supplier_hhi": float(supplier_hhi),
                 "shocked_supplier_share": float(shocked_supplier_share),
                 "icio_weight": float(icio_weight),
-                "shock_yoy_change": float(inputs.shock_yoy_change),
+                "shock_yoy_actual": float(inputs.shock_yoy_actual),
+                "shock_yoy_expected": shock_yoy_expected,
+                "shock_yoy_dev": shock_yoy_dev,
                 "import_baseline": import_baseline,
                 "import_delta": import_delta,
                 "shock_value": shock_value,
@@ -482,7 +526,7 @@ def run_multihop_scenario(
     active: Dict[str, Dict[str, object]] = {
         inputs.shock_node: {
             "shock_node": inputs.shock_node,
-            "shock_yoy_change": inputs.shock_yoy_change,
+            "shock_yoy_dev": inputs.shock_yoy_actual,
         }
     }
     all_rows: List[pd.DataFrame] = []
@@ -496,7 +540,7 @@ def run_multihop_scenario(
                 shock_node=str(shock["shock_node"]),
                 shock_year=inputs.shock_year,
                 shock_month=inputs.shock_month,
-                shock_yoy_change=float(shock["shock_yoy_change"]),
+                shock_yoy_actual=float(shock["shock_yoy_dev"]),
                 months_after_shock=inputs.months_after_shock,
                 history_months=inputs.history_months,
                 candidates=inputs.candidates,
@@ -513,6 +557,7 @@ def run_multihop_scenario(
                 supplier=supplier,
                 graph=graph,
                 icio_year=icio_year,
+                shock_is_dev=True,
             )
             all_rows.append(df_hop)
 
@@ -527,10 +572,10 @@ def run_multihop_scenario(
                 pred_yoy = float(dev)
                 # If multiple upstream shocks point to same node, propagate the most negative YoY.
                 existing = next_active.get(target_node)
-                if existing is None or float(pred_yoy) < float(existing["shock_yoy_change"]):
+                if existing is None or float(pred_yoy) < float(existing["shock_yoy_dev"]):
                     next_active[target_node] = {
                         "shock_node": target_node,
-                        "shock_yoy_change": float(pred_yoy),
+                        "shock_yoy_dev": float(pred_yoy),
                     }
         active = next_active
 
@@ -556,7 +601,7 @@ def main() -> None:
         default=2025,
         help="Shock year (defaults to 2025)",
     )
-    ap.add_argument("--shock-yoy-change", type=float, required=True, help="Shock magnitude as YoY change (e.g. -0.25)")
+    ap.add_argument("--shock-yoy-change", type=float, required=True, help="Shock magnitude as realized YoY change (e.g. -0.25). Converted to deviation internally.")
     ap.add_argument("--months-after-shock", type=int, default=1, help="Forecast horizon in months after the shock month")
     ap.add_argument("--history-months", type=int, default=24, help="Months of export history used to estimate expected growth")
     ap.add_argument("--candidates", type=int, default=50, help="How many downstream partners to evaluate before ranking")
@@ -582,7 +627,7 @@ def main() -> None:
         shock_node=str(args.shock_node),
         shock_year=int(args.shock_year),
         shock_month=int(args.shock_month),
-        shock_yoy_change=float(args.shock_yoy_change),
+        shock_yoy_actual=float(args.shock_yoy_change),
         months_after_shock=int(args.months_after_shock),
         history_months=int(args.history_months),
         candidates=int(args.candidates),
@@ -600,6 +645,7 @@ def main() -> None:
             inputs=inputs,
             use_network=not bool(args.no_network),
             hop=0,
+            shock_is_dev=False,
         )
     else:
         df = run_multihop_scenario(

@@ -5,7 +5,7 @@ clean_training_data.py
 Clean dataset rows produced by `build_shock_dataset.py`.
 
 Default behavior:
-  - remove any rows where `shock_yoy_change` (import YoY vs baseline) is positive
+  - remove any rows where `shock_yoy_dev` (import YoY deviation vs expected) is positive
 
 Optional filters can be enabled via CLI flags.
 """
@@ -38,33 +38,37 @@ def clean_training_df(
     df: pd.DataFrame,
     *,
     drop_positive_import_yoy: bool = True,
-    drop_missing_import_yoy: bool = False,
+    drop_missing_import_yoy: bool = True,
     require_nonnegative_months_after_shock: bool = True,
     require_target_col: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Args:
         df: Raw training dataframe.
-        drop_positive_import_yoy: Drop rows where shock_yoy_change > 0.
-        drop_missing_import_yoy: Drop rows where shock_yoy_change is NaN.
+        drop_positive_import_yoy: Drop rows where shock_yoy_dev > 0.
+        drop_missing_import_yoy: Drop rows where shock_yoy_dev is NaN.
         require_nonnegative_months_after_shock: Drop rows with months_after_shock < 0 (if present).
         require_target_col: If provided, drop rows where this column is NaN (useful for labels).
     """
     out = df.copy()
 
     if drop_positive_import_yoy:
-        if "shock_yoy_change" not in out.columns:
-            raise ValueError("Missing required column `shock_yoy_change`.")
-        out = out[~(out["shock_yoy_change"] > 0)]
+        if "shock_yoy_dev" not in out.columns:
+            raise ValueError("Missing required column `shock_yoy_dev`.")
+        out = out[~(out["shock_yoy_dev"] > 0)]
 
     if drop_missing_import_yoy:
-        if "shock_yoy_change" not in out.columns:
-            raise ValueError("Missing required column `shock_yoy_change`.")
-        out = out[out["shock_yoy_change"].notna()]
+        if "shock_yoy_dev" not in out.columns:
+            raise ValueError("Missing required column `shock_yoy_dev`.")
+        out = out[out["shock_yoy_dev"].notna()]
 
     if require_nonnegative_months_after_shock and "months_after_shock" in out.columns:
         out = out[out["months_after_shock"].fillna(0) >= 0]
 
+    if "shock_expected" in out.columns:
+        out = out[~(out["shock_expected"] < 0)]
+    if "prop_expected" in out.columns:
+        out = out[~(out["prop_expected"] < 0)]
 
     if require_target_col is not None:
         if require_target_col not in out.columns:
@@ -97,12 +101,12 @@ def main() -> None:
     parser.add_argument(
         "--keep-positive-import-yoy",
         action="store_true",
-        help="Keep rows where shock_yoy_change > 0 (default: drop them).",
+        help="Keep rows where shock_yoy_dev > 0 (default: drop them).",
     )
     parser.add_argument(
         "--drop-missing-import-yoy",
         action="store_true",
-        help="Also drop rows with missing shock_yoy_change (default: keep).",
+        help="Also drop rows with missing shock_yoy_dev (default: keep).",
     )
     parser.add_argument(
         "--require-target-col",
@@ -133,10 +137,10 @@ def main() -> None:
     cleaned.to_csv(out_path, index=False)
 
     # Minimal console report
-    if "shock_yoy_change" in df.columns:
-        pct_pos = float((df["shock_yoy_change"] > 0).mean())
-        miss = float(df["shock_yoy_change"].isna().mean())
-        print(f"Input:  {n0} rows | shock_yoy_change>0: {pct_pos:.1%} | missing: {miss:.1%}")
+    if "shock_yoy_dev" in df.columns:
+        pct_pos = float((df["shock_yoy_dev"] > 0).mean())
+        miss = float(df["shock_yoy_dev"].isna().mean())
+        print(f"Input:  {n0} rows | shock_yoy_dev>0: {pct_pos:.1%} | missing: {miss:.1%}")
     if EVENT_COL in df.columns:
         before = int(df[EVENT_COL].nunique())
         after = int(cleaned[EVENT_COL].nunique()) if len(cleaned) else 0

@@ -52,6 +52,12 @@ except Exception as e:  # pragma: no cover
 TARGET_COL = "prop_yoy_dev"
 GROUP_COL = "shock_event"
 
+# Training-time stability guards (hard defaults).
+# These are applied even if upstream cleaning missed something.
+LABEL_MAX_ABS_DEFAULT = 5.0   # drop rows with |prop_yoy_dev| > 5 (500pp)
+LABEL_CLIP_ABS_DEFAULT = 2.0  # then clip prop_yoy_dev into [-2, +2] (200pp)
+SHOCK_CLIP_ABS_DEFAULT = 5.0  # clip shock_yoy_dev (feature) into [-5, +5]
+
 
 @dataclass(frozen=True)
 class FeatureSchema:
@@ -78,10 +84,12 @@ class FeatureSchema:
 FEATURE_SCHEMA = FeatureSchema(
     # User-controllable shock inputs
     numeric_cols=(
-        "shock_yoy_change",  # user-specified shock % (YoY vs baseline)
-        "shock_value",  # user-specified absolute delta (compatible with dataset)
+        # Hard rename: propagated shock rate is deviation from expected YoY (shock-only).
+        "shock_yoy_dev",
+        # Option A: shock-only level delta (vs expected), allocated by ICIO weight.
+        "shock_value",
         "shock_value_x_shocked_share",
-        "shock_yoy_change_x_shocked_share",
+        "shock_yoy_dev_x_shocked_share",
         "shock_value_x_diversification",
         # exposure / network
         "icio_edge_value",
@@ -114,7 +122,7 @@ FEATURE_SCHEMA = FeatureSchema(
         "obs_month",
         "months_bucket", 
         "shock_value_x_shocked_share",
-        "shock_yoy_change_x_shocked_share",
+        "shock_yoy_dev_x_shocked_share",
         "shock_value_x_diversification",
     ),
 )
@@ -168,10 +176,10 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     # Interaction features (requested)
     # - shock_value * shocked_supplier_share
-    # - shock_yoy_change * shocked_supplier_share
+    # - shock_yoy_dev * shocked_supplier_share
     # - shock_value * (1 - supplier_hhi)
     df["shock_value_x_shocked_share"] = df["shock_value"].astype(float) * df["shocked_supplier_share"].astype(float)
-    df["shock_yoy_change_x_shocked_share"] = df["shock_yoy_change"].astype(float) * df["shocked_supplier_share"].astype(float)
+    df["shock_yoy_dev_x_shocked_share"] = df["shock_yoy_dev"].astype(float) * df["shocked_supplier_share"].astype(float)
     df["shock_value_x_diversification"] = df["shock_value"].astype(float) * (1.0 - df["supplier_hhi"].astype(float))
 
     # Stabilize types
@@ -507,6 +515,40 @@ def filter_and_clip_labels(
     return X2, y2, g2
 
 
+def clip_shock_feature(
+    X: pd.DataFrame,
+    *,
+    clip_abs: Optional[float],
+) -> pd.DataFrame:
+    """
+    Clip extreme values of the *input shock* feature `shock_yoy_dev`.
+
+    This is distinct from label clipping. It stabilizes training when shock baselines/expectations
+    produce rare but extreme deviations.
+
+    Notes:
+    - If `shock_yoy_dev_x_shocked_share` exists, we recompute it from the clipped values to keep
+      the interaction consistent.
+    """
+    if clip_abs is None:
+        return X
+
+    if "shock_yoy_dev" not in X.columns:
+        return X
+
+    c = float(clip_abs)
+    if c <= 0:
+        return X
+
+    X2 = X.copy()
+    X2["shock_yoy_dev"] = X2["shock_yoy_dev"].astype(float).clip(lower=-c, upper=c)
+    if "shock_yoy_dev_x_shocked_share" in X2.columns and "shocked_supplier_share" in X2.columns:
+        X2["shock_yoy_dev_x_shocked_share"] = (
+            X2["shock_yoy_dev"].astype(float) * X2["shocked_supplier_share"].astype(float)
+        )
+    return X2
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train shock propagation model (target=prop_yoy_dev)")
     parser.add_argument(
@@ -538,18 +580,6 @@ def main() -> None:
         action="store_true",
         help="Weight rows so each shock_event contributes equal total weight during training/CV.",
     )
-    parser.add_argument(
-        "--label-max-abs",
-        type=float,
-        default=5.0,
-        help="Drop rows with |prop_yoy_dev| greater than this (default 5.0 = 500pp). Set 0 to disable.",
-    )
-    parser.add_argument(
-        "--label-clip-abs",
-        type=float,
-        default=2.0,
-        help="Clip prop_yoy_dev to [-X, X] after dropping extremes (default 2.0 = 200pp). Set 0 to disable.",
-    )
     args = parser.parse_args()
 
     data_path = Path(args.data)
@@ -559,10 +589,29 @@ def main() -> None:
     print(f"Loading data: {data_path}")
     df = pd.read_csv(data_path)
 
+    # Safety: if expected levels ever go negative, drop those rows (deviations become unstable).
+    # This should already be handled in `clean_training_data.py`, but we enforce here as well.
+    n0 = len(df)
+    if "shock_expected" in df.columns:
+        df = df[~(pd.to_numeric(df["shock_expected"], errors="coerce") < 0)].copy()
+    if "prop_expected" in df.columns:
+        df = df[~(pd.to_numeric(df["prop_expected"], errors="coerce") < 0)].copy()
+    if len(df) != n0:
+        print(f"Filtered negative expected rows: {n0:,} → {len(df):,}")
+
     X, y, groups = build_xy_groups(df)
-    max_abs = None if args.label_max_abs == 0 else float(args.label_max_abs)
-    clip_abs = None if args.label_clip_abs == 0 else float(args.label_clip_abs)
-    X, y, groups = filter_and_clip_labels(X, y, groups, max_abs=max_abs, clip_abs=clip_abs)
+    # Hard-default training stabilization:
+    # - drop extreme labels
+    # - clip remaining labels
+    # - clip shock feature and recompute its interaction
+    X, y, groups = filter_and_clip_labels(
+        X,
+        y,
+        groups,
+        max_abs=float(LABEL_MAX_ABS_DEFAULT),
+        clip_abs=float(LABEL_CLIP_ABS_DEFAULT),
+    )
+    X = clip_shock_feature(X, clip_abs=float(SHOCK_CLIP_ABS_DEFAULT))
     print(f"Rows with label ({TARGET_COL}): {len(y):,}")
     print(f"Unique shock events: {groups.nunique():,}")
     if len(y) > 0:
