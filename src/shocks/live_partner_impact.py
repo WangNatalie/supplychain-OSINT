@@ -252,7 +252,15 @@ def run_scenario(
     fallbacks = _median_fallbacks_from_training(training_csv)
 
     # Comtrade API (optional)
-    api = ComtradeAPI(rate_limit_delay=1.0) if use_network else None
+    api = (
+        ComtradeAPI(
+            rate_limit_delay=1.0,
+            enable_cache=True,
+            cache_dir=Path(__file__).resolve().parent / "comtrade_cache",
+        )
+        if use_network
+        else None
+    )
 
     shocked_country = _parse_country(inputs.shock_node)
     shocked_sector = _parse_sector(inputs.shock_node)
@@ -604,7 +612,7 @@ def main() -> None:
     ap.add_argument("--shock-yoy-change", type=float, required=True, help="Shock magnitude as realized YoY change (e.g. -0.25). Converted to deviation internally.")
     ap.add_argument("--months-after-shock", type=int, default=1, help="Forecast horizon in months after the shock month")
     ap.add_argument("--history-months", type=int, default=24, help="Months of export history used to estimate expected growth")
-    ap.add_argument("--candidates", type=int, default=50, help="How many downstream partners to evaluate before ranking")
+    ap.add_argument("--candidates", type=int, default=5, help="How many downstream partners to evaluate before ranking")
     ap.add_argument("--hops", type=int, default=1, help="Number of propagation hops (>=1). Only negative shocks propagate.")
 
     ap.add_argument(
